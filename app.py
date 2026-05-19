@@ -1,18 +1,13 @@
 """
-app.py — Dog Nose Biometrics (DNNetV3 SOTA) — Streamlit Frontend
+app.py — Dog Nose Biometrics (DNNetV3 SOTA) — Minimal Frontend
 ================================================================
-v2.0 — Multi-Embedding Architecture (Strategy B: Max Similarity)
+v2.1 — Simple 2D Interface (No Graphics/Animations)
 
-Connects to:
-  • det5.py  →  DNNetV3 model (TinyViT-21M, 1024-d embeddings)
-                CLAHEPipeline (CLAHE + sharpness scoring)
-  • dog_biometrics.db  →  SQLite with two-table schema:
-        dogs       : id, name, registered_at
-        embeddings : id, dog_id (FK), embedding BLOB, photo BLOB, sharpness, added_at
-
-Matching Strategy: B (Max Similarity)
-  → For each dog, compare query against ALL stored embeddings.
-  → The dog's score = highest cosine similarity across all its embeddings.
+Features:
+  • Two-table SQLite Schema
+  • Strategy B: Max Similarity Matching
+  • Quality-gated Auto-enrollment
+  • Per-embedding Management
 """
 
 import streamlit as st
@@ -24,25 +19,22 @@ from PIL import Image
 import io
 import os
 
-# ── Model imports (det5 is the SOTA module) ────────────────────────────────────
+# -- Model Imports --
 from det5 import DNNetV3, CLAHEPipeline
 
-# ── Constants ──────────────────────────────────────────────────────────────────
+# -- Configuration --
 DB_NAME          = "dog_biometrics.db"
-EMBED_DIM        = DNNetV3.EMBED_DIM          # 1024
-MATCH_THRESH     = 0.82                        # Cosine similarity threshold
-ENROLL_THRESH    = 0.88                        # Minimum confidence for auto-enrollment
-QUALITY_WARN     = 100.0                       # Laplacian variance below → warn user
-QUALITY_MIN_ENR  = 150.0                       # Minimum sharpness for auto-enrollment
-MAX_EMB_PER_DOG  = 20                          # Cap embeddings per identity
-
+MATCH_THRESH     = 0.82
+ENROLL_THRESH    = 0.88
+QUALITY_WARN     = 100.0
+QUALITY_MIN_ENR  = 150.0
+MAX_EMB_PER_DOG  = 20
 
 # ==============================================================================
-# DATABASE LAYER — Two-Table Schema
+# DATABASE LAYER
 # ==============================================================================
 
 def init_db():
-    """Create the two-table schema if it doesn't exist."""
     conn = sqlite3.connect(DB_NAME)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS dogs (
@@ -66,12 +58,7 @@ def init_db():
     conn.commit()
     conn.close()
 
-
 def get_or_create_dog(name: str) -> int:
-    """
-    Return the dog_id for the given name.
-    Creates a new dog row if the name doesn't exist yet.
-    """
     conn = sqlite3.connect(DB_NAME)
     row = conn.execute("SELECT id FROM dogs WHERE name = ?", (name,)).fetchone()
     if row:
@@ -83,450 +70,207 @@ def get_or_create_dog(name: str) -> int:
     conn.close()
     return dog_id
 
-
 def add_embedding(dog_id: int, embedding: torch.Tensor, photo_bytes: bytes, sharpness: float):
-    """
-    Insert a new embedding for the given dog.
-    If the dog already has MAX_EMB_PER_DOG embeddings, drop the one with the
-    lowest sharpness score to keep the gallery clean.
-    """
     blob = embedding.detach().cpu().numpy().astype(np.float32).tobytes()
     conn = sqlite3.connect(DB_NAME)
     conn.execute("PRAGMA foreign_keys = ON")
-
-    # Check current count
-    count = conn.execute(
-        "SELECT COUNT(*) FROM embeddings WHERE dog_id = ?", (dog_id,)
-    ).fetchone()[0]
-
+    count = conn.execute("SELECT COUNT(*) FROM embeddings WHERE dog_id = ?", (dog_id,)).fetchone()[0]
     if count >= MAX_EMB_PER_DOG:
-        # Drop the worst-quality embedding
-        worst = conn.execute(
-            "SELECT id FROM embeddings WHERE dog_id = ? ORDER BY sharpness ASC LIMIT 1",
-            (dog_id,),
-        ).fetchone()
-        if worst:
-            conn.execute("DELETE FROM embeddings WHERE id = ?", (worst[0],))
-
-    conn.execute(
-        "INSERT INTO embeddings (dog_id, embedding, photo, sharpness) VALUES (?, ?, ?, ?)",
-        (dog_id, blob, photo_bytes, sharpness),
-    )
+        worst = conn.execute("SELECT id FROM embeddings WHERE dog_id = ? ORDER BY sharpness ASC LIMIT 1", (dog_id,)).fetchone()
+        if worst: conn.execute("DELETE FROM embeddings WHERE id = ?", (worst[0],))
+    conn.execute("INSERT INTO embeddings (dog_id, embedding, photo, sharpness) VALUES (?, ?, ?, ?)", (dog_id, blob, photo_bytes, sharpness))
     conn.commit()
     conn.close()
 
-
-def get_all_dog_names() -> list[str]:
-    """Return a sorted list of all registered dog names."""
+def get_all_dog_names():
     conn = sqlite3.connect(DB_NAME)
     rows = conn.execute("SELECT name FROM dogs ORDER BY name").fetchall()
     conn.close()
     return [r[0] for r in rows]
 
-
-def get_dog_gallery() -> dict:
-    """
-    Returns a dict: { dog_name: [list of 1024-d tensors] }
-    Used by Strategy B (Max Similarity) matching.
-    """
+def get_dog_gallery():
     conn = sqlite3.connect(DB_NAME)
-    rows = conn.execute("""
-        SELECT d.name, e.embedding
-        FROM dogs d
-        JOIN embeddings e ON e.dog_id = d.id
-        ORDER BY d.name
-    """).fetchall()
+    rows = conn.execute("SELECT d.name, e.embedding FROM dogs d JOIN embeddings e ON e.dog_id = d.id").fetchall()
     conn.close()
-
     gallery = {}
     for name, blob in rows:
         vec = np.frombuffer(blob, dtype=np.float32)
-        if len(vec) != EMBED_DIM:
-            continue
-        gallery.setdefault(name, []).append(torch.from_numpy(vec.copy()))
+        if len(vec) == EMBED_DIM:
+            gallery.setdefault(name, []).append(torch.from_numpy(vec.copy()))
     return gallery
 
-
-def get_dog_details() -> list[dict]:
-    """
-    Returns detailed info for the Manage page:
-    [ { id, name, registered_at, embedding_count, embeddings: [{emb_id, sharpness, added_at}] } ]
-    """
+def get_dog_details():
     conn = sqlite3.connect(DB_NAME)
     dogs = conn.execute("SELECT id, name, registered_at FROM dogs ORDER BY name").fetchall()
     result = []
-    for dog_id, name, reg_at in dogs:
-        embs = conn.execute(
-            "SELECT id, sharpness, added_at FROM embeddings WHERE dog_id = ? ORDER BY added_at DESC",
-            (dog_id,),
-        ).fetchall()
-        result.append({
-            "id"             : dog_id,
-            "name"           : name,
-            "registered_at"  : reg_at,
-            "embedding_count": len(embs),
-            "embeddings"     : [{"emb_id": e[0], "sharpness": e[1], "added_at": e[2]} for e in embs],
-        })
+    for d_id, name, reg_at in dogs:
+        embs = conn.execute("SELECT id, sharpness, added_at FROM embeddings WHERE dog_id = ? ORDER BY added_at DESC", (d_id,)).fetchall()
+        result.append({"id": d_id, "name": name, "registered_at": reg_at, "count": len(embs), "embs": embs})
     conn.close()
     return result
 
-
-def delete_dog_by_id(dog_id: int):
-    """Delete a dog and all its embeddings (CASCADE)."""
+def delete_dog(d_id):
     conn = sqlite3.connect(DB_NAME)
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("DELETE FROM dogs WHERE id = ?", (dog_id,))
+    conn.execute("PRAGMA foreign_keys = ON; DELETE FROM dogs WHERE id = ?", (d_id,))
     conn.commit()
     conn.close()
 
-
-def delete_embedding_by_id(emb_id: int):
-    """Delete a single embedding."""
+def delete_emb(e_id):
     conn = sqlite3.connect(DB_NAME)
-    conn.execute("DELETE FROM embeddings WHERE id = ?", (emb_id,))
+    conn.execute("DELETE FROM embeddings WHERE id = ?", (e_id,))
     conn.commit()
     conn.close()
 
-
-def get_dog_count() -> int:
-    if not os.path.exists(DB_NAME):
-        return 0
-    conn = sqlite3.connect(DB_NAME)
-    count = conn.execute("SELECT COUNT(*) FROM dogs").fetchone()[0]
-    conn.close()
-    return count
-
-
-def get_embedding_count() -> int:
-    if not os.path.exists(DB_NAME):
-        return 0
-    conn = sqlite3.connect(DB_NAME)
-    count = conn.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0]
-    conn.close()
-    return count
-
-
-def wipe_database():
-    if os.path.exists(DB_NAME):
-        os.remove(DB_NAME)
-
-
 # ==============================================================================
-# MATCHING ENGINE — Strategy B: Max Similarity
+# MATCHING LOGIC
 # ==============================================================================
 
-def match_query(query_vec: torch.Tensor, gallery: dict) -> list[tuple]:
-    """
-    Strategy B: Max Similarity.
-
-    For each dog, compute cosine similarity against ALL its stored embeddings.
-    The dog's score = the HIGHEST similarity found.
-
-    Returns sorted list: [(dog_name, best_sim, best_emb_index), ...]
-    """
+def match_query(query_vec, gallery):
     results = []
     for name, emb_list in gallery.items():
-        best_sim = -1.0
-        best_idx = 0
-        for i, stored_vec in enumerate(emb_list):
-            sim = F.cosine_similarity(
-                query_vec.unsqueeze(0), stored_vec.unsqueeze(0)
-            ).item()
-            if sim > best_sim:
-                best_sim = sim
-                best_idx = i
-        results.append((name, best_sim, best_idx))
-
+        best_sim = max([F.cosine_similarity(query_vec.unsqueeze(0), v.unsqueeze(0)).item() for v in emb_list])
+        results.append((name, best_sim))
     results.sort(key=lambda x: x[1], reverse=True)
     return results
 
-
 # ==============================================================================
-# MODEL LAYER
+# UTILS
 # ==============================================================================
 
-@st.cache_resource(show_spinner="Loading DNNetV3 (TinyViT-21M)…")
-def load_model_and_pipeline():
-    """Load once, reuse across reruns. Cached until app restarts."""
-    model    = DNNetV3(pretrained=True)
-    model.eval()
-    pipeline = CLAHEPipeline(image_size=224)
-    return model, pipeline
+@st.cache_resource
+def load_model():
+    # If custom trained weights exist, load them and use the head.
+    # Otherwise, bypass the head and use raw 576-d backbone features for SOTA ImageNet zero-shot matching.
+    ckpt_path = "checkpoints/teacher_best.pth"
+    if os.path.exists(ckpt_path):
+        m = DNNetV3(pretrained=True, use_head=True)
+        ckpt = torch.load(ckpt_path, map_location="cpu")
+        state_dict = ckpt["model_state_dict"] if "model_state_dict" in ckpt else ckpt
+        m.load_state_dict(state_dict)
+    else:
+        m = DNNetV3(pretrained=True, use_head=False)
+    m.eval()
+    p = CLAHEPipeline(image_size=224)
+    return m, p
 
-
-@torch.no_grad()
-def get_embedding_from_image(model: DNNetV3, pipeline: CLAHEPipeline, pil_img: Image.Image):
-    """
-    Returns:
-        embedding  : (1024,) L2-normalized tensor on CPU
-        sharpness  : float — Laplacian variance (quality score)
-    """
-    tensor, sharpness = pipeline(pil_img)
-    tensor    = tensor.unsqueeze(0)
-    embedding = model(tensor).squeeze(0)
-    return embedding, sharpness
-
-
-def image_to_jpeg_bytes(img: Image.Image) -> bytes:
-    """Thumbnail + JPEG compress a PIL image for storage."""
+def img_to_bytes(img):
     buf = io.BytesIO()
-    thumb = img.copy()
-    thumb.thumbnail((256, 256))
-    thumb.save(buf, format="JPEG", quality=85)
+    t = img.copy(); t.thumbnail((256, 256))
+    t.save(buf, format="JPEG", quality=85)
     return buf.getvalue()
 
+def get_embedding_from_image(m, p, img):
+    t, s = p(img)
+    with torch.no_grad():
+        emb = m(t.unsqueeze(0)).squeeze(0)
+    return emb, s
 
 # ==============================================================================
-# APP
+# APP INTERFACE
 # ==============================================================================
 
-st.set_page_config(
-    page_title = "DNNetV3 | Dog Nose Biometrics",
-    page_icon  = "🐾",
-    layout     = "centered",
-)
-
-# ── Init ──────────────────────────────────────────────────────────────────────
+st.set_page_config(page_title="Dog Biometrics", layout="centered")
 init_db()
-model, pipeline = load_model_and_pipeline()
+model, pipeline = load_model()
+EMBED_DIM = 576 if not model.use_head else 1024
 
-# ── Sidebar ───────────────────────────────────────────────────────────────────
-with st.sidebar:
-    st.image("https://img.icons8.com/color/96/dog.png", width=64)
-    st.title("🐾 DNNetV3")
-    st.caption("SOTA Dog Nose Biometrics")
-    st.markdown("---")
-    menu   = ["🔍 Identify Dog", "📝 Register Dog", "⚙️ Manage Database"]
-    choice = st.radio("Navigation", menu, label_visibility="collapsed")
-    st.markdown("---")
-    col_a, col_b = st.columns(2)
-    col_a.metric("Dogs", get_dog_count())
-    col_b.metric("Photos", get_embedding_count())
-    st.caption("Strategy B: Max Similarity")
-    st.caption("Model: TinyViT-21M | 1024-d | MagFace")
+# Sidebar
+choice = st.sidebar.radio("Navigation", ["Identify", "Register", "Manage"])
 
-
-# ==============================================================================
-# PAGE: IDENTIFY — with Confirm-to-Enroll
-# ==============================================================================
-if choice == "🔍 Identify Dog":
-    st.title("🔍 Identify Dog")
-    st.markdown("Upload a nose photo to match against all registered dogs.")
-
-    file = st.file_uploader(
-        "Upload Nose Photo", type=["jpg", "jpeg", "png"], key="identify_upload"
-    )
-
-    if file:
-        img = Image.open(file).convert("RGB")
-        col1, col2 = st.columns([1, 2])
-        col1.image(img, caption="Query Image", width="stretch")
-
-        with st.spinner("Running CLAHE → TinyViT-21M embedding…"):
-            query_vec, sharpness = get_embedding_from_image(model, pipeline, img)
-
-        # Quality indicator
-        quality_pct = min(sharpness / 500.0, 1.0)
-        col2.markdown("**Image Quality**")
-        col2.progress(quality_pct, text=f"Sharpness: {sharpness:.0f}")
-        if sharpness < QUALITY_WARN:
-            col2.warning("⚠️ Low quality — results may be less accurate.")
-
-        gallery = get_dog_gallery()
-
-        if not gallery:
-            st.error("Database is empty. Register dogs first via **Register Dog**.")
-        else:
-            # Strategy B matching
-            rankings = match_query(query_vec, gallery)
-            best_name, best_sim, _ = rankings[0]
-
-            st.markdown("---")
-
-            if best_sim >= MATCH_THRESH:
-                st.success(f"✅ **Match Found: {best_name}**")
-                st.progress(float(best_sim), text=f"Confidence: {best_sim:.4f}")
-                emb_count = len(gallery.get(best_name, []))
-                st.caption(f"Matched against {emb_count} stored embedding(s) for {best_name}")
-
-                # ── Confirm-to-Enroll ──────────────────────────────────
-                can_enroll = (best_sim >= ENROLL_THRESH and sharpness >= QUALITY_MIN_ENR)
-                st.markdown("---")
-                st.markdown("**Is this identification correct?**")
-
-                c1, c2 = st.columns(2)
-                if c1.button("✅ Yes, correct!", key="confirm_yes", type="primary",
-                             disabled=not can_enroll):
-                    dog_id = get_or_create_dog(best_name)
-                    photo_bytes = image_to_jpeg_bytes(img)
-                    add_embedding(dog_id, query_vec, photo_bytes, sharpness)
-                    st.success(
-                        f"📸 Auto-enrolled this photo into **{best_name}**'s gallery! "
-                        f"(now {emb_count + 1} embeddings)"
-                    )
-                    st.balloons()
-
-                if not can_enroll and best_sim >= MATCH_THRESH:
-                    if best_sim < ENROLL_THRESH:
-                        st.caption(
-                            f"ℹ️ Auto-enrollment requires ≥{ENROLL_THRESH:.0%} confidence "
-                            f"(current: {best_sim:.0%})"
-                        )
-                    elif sharpness < QUALITY_MIN_ENR:
-                        st.caption(
-                            f"ℹ️ Auto-enrollment requires sharpness ≥{QUALITY_MIN_ENR:.0f} "
-                            f"(current: {sharpness:.0f})"
-                        )
-
-                if c2.button("❌ No, wrong match", key="confirm_no"):
-                    st.info("No changes made. Consider registering this dog if it's new.")
-
-            else:
-                st.error("❌ **No Match Found** — dog may not be registered.")
-                st.info(
-                    f"Closest: **{best_name}** — similarity {best_sim:.4f} "
-                    f"(threshold: {MATCH_THRESH})"
-                )
-
-            # Full ranking
-            with st.expander("📊 Full Ranking (Strategy B: Max Similarity)"):
-                for name, sim, _ in rankings:
-                    emb_count = len(gallery.get(name, []))
-                    st.write(f"`{name}` — {sim:.4f}  ({emb_count} embedding{'s' if emb_count != 1 else ''})")
-                    st.progress(max(0.0, float(sim)))
-
-
-# ==============================================================================
-# PAGE: REGISTER — New Dog / Existing Dog toggle
-# ==============================================================================
-elif choice == "📝 Register Dog":
-    st.title("📝 Register Dog")
-
-    # ── Mode toggle ──
-    mode = st.radio(
-        "Registration Mode",
-        ["🆕 New Dog", "📂 Add Photo to Existing Dog"],
-        horizontal=True,
-    )
-
-    if mode == "🆕 New Dog":
-        st.markdown("Register a brand new dog into the system.")
-        dog_name = st.text_input("Dog's Name", placeholder="e.g. Buddy", key="new_name")
-        existing_names = get_all_dog_names()
-
-        # Warn on duplicate
-        if dog_name and dog_name.strip() in existing_names:
-            st.warning(
-                f"⚠️ A dog named **{dog_name.strip()}** already exists! "
-                f"Did you mean to **Add Photo to Existing Dog** instead?"
-            )
-    else:
-        st.markdown("Add another nose photo to strengthen an existing dog's profile.")
-        existing_names = get_all_dog_names()
-        if not existing_names:
-            st.error("No dogs registered yet. Use **New Dog** mode first.")
-            dog_name = None
-        else:
-            dog_name = st.selectbox("Select Dog", existing_names, key="existing_select")
-
-    file = st.file_uploader(
-        "Upload Clear Nose Photo", type=["jpg", "jpeg", "png"], key="register_upload"
-    )
-
-    if file:
-        img = Image.open(file).convert("RGB")
-        st.image(img, caption="Preview", width=260)
-
-        with st.spinner("Analysing image quality…"):
-            _, sharpness = get_embedding_from_image(model, pipeline, img)
-        q_pct = min(sharpness / 500.0, 1.0)
-        st.progress(q_pct, text=f"Sharpness score: {sharpness:.0f}")
-        if sharpness < QUALITY_WARN:
-            st.warning("⚠️ Image is blurry — consider a sharper photo.")
-
-    can_register = bool(dog_name and file)
-    btn_label = "✅ Register New Dog" if mode == "🆕 New Dog" else "📸 Add Photo"
-
-    if st.button(btn_label, disabled=not can_register, type="primary"):
-        with st.spinner(f"Extracting {EMBED_DIM}-d biometric fingerprint…"):
+# PAGE: IDENTIFY
+if choice == "Identify":
+    st.header("Identify Dog")
+    
+    tab_upload, tab_camera = st.tabs(["📁 Upload or Paste Image", "📷 Take Live Photo"])
+    
+    img = None
+    with tab_upload:
+        st.markdown("💡 **Tip:** You can browse, drag & drop, or click below and press **Ctrl+V** to paste an image directly from your clipboard!")
+        file = st.file_uploader("Upload or Paste nose image", type=["jpg", "png", "jpeg"], key="identify_upload")
+        if file:
             img = Image.open(file).convert("RGB")
-            emb, sharpness = get_embedding_from_image(model, pipeline, img)
-            photo_bytes = image_to_jpeg_bytes(img)
-
-            dog_id = get_or_create_dog(dog_name.strip())
-            add_embedding(dog_id, emb, photo_bytes, sharpness)
-
-        if mode == "🆕 New Dog":
-            st.success(f"🎉 **{dog_name}** registered successfully!")
+            
+    with tab_camera:
+        camera_file = st.camera_input("Capture Nose Print", key="identify_camera")
+        if camera_file:
+            img = Image.open(camera_file).convert("RGB")
+            
+    if img is not None:
+        st.image(img, width=220, caption="Selected Image")
+        with st.spinner("Processing..."):
+            vec, sharp = get_embedding_from_image(model, pipeline, img)
+        st.text(f"Image Sharpness: {sharp:.1f}")
+        if sharp < QUALITY_WARN: st.warning("Warning: Low quality image.")
+        
+        gallery = get_dog_gallery()
+        if not gallery:
+            st.error("Database empty.")
         else:
-            st.success(f"📸 New photo added to **{dog_name}**'s gallery!")
+            rankings = match_query(vec, gallery)
+            name, sim = rankings[0]
+            if sim >= MATCH_THRESH:
+                st.success(f"Match: {name} (Score: {sim:.4f})")
+                if st.button("Confirm Match and Save Photo"):
+                    if sim >= ENROLL_THRESH and sharp >= QUALITY_MIN_ENR:
+                        add_embedding(get_or_create_dog(name), vec, img_to_bytes(img), sharp)
+                        st.success("Photo successfully added to database!")
+                    else:
+                        st.error("Score or quality too low for auto-save.")
+            else:
+                st.error(f"No match found. Closest: {name} ({sim:.4f})")
 
-        st.metric("Embedding Dimension", f"{EMBED_DIM}-d")
-        st.metric("Image Sharpness", f"{sharpness:.0f}")
-        st.balloons()
-
-
-# ==============================================================================
-# PAGE: MANAGE DATABASE
-# ==============================================================================
-elif choice == "⚙️ Manage Database":
-    st.title("⚙️ Manage Database")
-
-    details = get_dog_details()
-    col_a, col_b = st.columns(2)
-    col_a.metric("Total Dogs", len(details))
-    col_b.metric("Total Embeddings", sum(d["embedding_count"] for d in details))
-
-    if not details:
-        st.info("No dogs registered yet.")
+# PAGE: REGISTER
+elif choice == "Register":
+    st.header("Register Dog")
+    mode = st.radio("Mode", ["New Dog", "Existing Dog"])
+    if mode == "New Dog":
+        name = st.text_input("Name")
     else:
-        st.markdown("---")
-        for dog in details:
-            label = f"🐶 {dog['name']}  —  {dog['embedding_count']} photo(s)"
-            with st.expander(label):
-                st.caption(f"ID: {dog['id']}  |  Registered: {dog['registered_at']}")
-                st.caption(f"Embeddings: {dog['embedding_count']} / {MAX_EMB_PER_DOG} max")
+        names = get_all_dog_names()
+        name = st.selectbox("Select Dog", names) if names else None
+    
+    tab_upload, tab_camera = st.tabs(["📁 Upload or Paste Image", "📷 Take Live Photo"])
+    
+    img = None
+    with tab_upload:
+        st.markdown("💡 **Tip:** You can browse, drag & drop, or click below and press **Ctrl+V** to paste an image directly from your clipboard!")
+        file = st.file_uploader("Upload or Paste nose image", type=["jpg", "png", "jpeg"], key="register_upload")
+        if file:
+            img = Image.open(file).convert("RGB")
+            
+    with tab_camera:
+        camera_file = st.camera_input("Capture Nose Print", key="register_camera")
+        if camera_file:
+            img = Image.open(camera_file).convert("RGB")
+            
+    if img is not None and name:
+        st.image(img, width=220, caption="Preview Image")
+        if st.button("Save to Database"):
+            vec, sharp = get_embedding_from_image(model, pipeline, img)
+            add_embedding(get_or_create_dog(name), vec, img_to_bytes(img), sharp)
+            st.success(f"Successfully saved {name} to database!")
 
-                # List individual embeddings
-                if dog["embeddings"]:
-                    st.markdown("**Stored Photos:**")
-                    for emb in dog["embeddings"]:
-                        ecol1, ecol2 = st.columns([3, 1])
-                        ecol1.caption(
-                            f"  #{emb['emb_id']}  |  "
-                            f"Sharpness: {emb['sharpness']:.0f}  |  "
-                            f"Added: {emb['added_at']}"
-                        )
-                        if ecol2.button("🗑️", key=f"del_emb_{emb['emb_id']}"):
-                            delete_embedding_by_id(emb["emb_id"])
-                            # If this was the last embedding, delete the dog too
-                            if dog["embedding_count"] <= 1:
-                                delete_dog_by_id(dog["id"])
-                                st.success(f"Deleted **{dog['name']}** (last photo removed).")
-                            else:
-                                st.success(f"Deleted embedding #{emb['emb_id']}.")
-                            st.rerun()
-
-                st.markdown("---")
-                if st.button(
-                    f"🗑️ Delete {dog['name']} entirely",
-                    key=f"del_dog_{dog['id']}",
-                    type="secondary",
-                ):
-                    delete_dog_by_id(dog["id"])
-                    st.success(f"Deleted **{dog['name']}** and all embeddings.")
+# PAGE: MANAGE
+elif choice == "Manage":
+    st.header("Manage Database")
+    details = get_dog_details()
+    st.write(f"Total Dogs: {len(details)}")
+    for d in details:
+        with st.expander(f"{d['name']} ({d['count']} photos)"):
+            st.text(f"Registered: {d['registered_at']}")
+            for e in d['embs']:
+                c1, c2 = st.columns([4, 1])
+                c1.text(f"Photo ID: {e[0]} | Sharpness: {e[1]:.1f}")
+                if c2.button("Delete", key=f"e_{e[0]}"):
+                    delete_emb(e[0])
+                    if d['count'] <= 1: delete_dog(d['id'])
                     st.rerun()
-
-    st.markdown("---")
-    st.subheader("🚨 Danger Zone")
-    with st.expander("Wipe entire database"):
-        st.warning("This permanently deletes **all** dogs and **all** embeddings.")
-        confirm = st.text_input(
-            'Type  `WIPE`  to confirm', key="wipe_confirm", placeholder="WIPE"
-        )
-        if st.button("Delete All Dogs", type="primary", disabled=(confirm != "WIPE")):
-            wipe_database()
-            init_db()
-            st.cache_resource.clear()
-            st.success("Database wiped. All entries deleted.")
-            st.rerun()
+            if st.button(f"Delete Entire Record: {d['name']}", key=f"d_{d['id']}"):
+                delete_dog(d['id'])
+                st.rerun()
+    
+    st.write("---")
+    if st.button("Wipe Entire Database"):
+        if os.path.exists(DB_NAME): os.remove(DB_NAME)
+        init_db()
+        st.rerun()

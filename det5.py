@@ -131,8 +131,9 @@ class DNNetV3(nn.Module):
     FEATURE_DIM = 576       # TinyViT-21M output
     EMBED_DIM   = 1024      # Final embedding dimension
 
-    def __init__(self, pretrained: bool = True):
+    def __init__(self, pretrained: bool = True, use_head: bool = False):
         super().__init__()
+        self.use_head = use_head
 
         # ----- Backbone -----
         # num_classes=0 removes the classification head; returns raw features.
@@ -156,12 +157,15 @@ class DNNetV3(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Returns L2-normalized 1024-d embeddings.
-        Shape: (B, 1024)
+        Returns L2-normalized embeddings.
+        Shape: (B, 1024) if use_head else (B, 576)
         """
         feat = self.backbone(x)        # (B, 576)
-        emb  = self.head(feat)         # (B, 1024)
-        return F.normalize(emb, p=2, dim=1)
+        if self.use_head:
+            emb = self.head(feat)      # (B, 1024)
+            return F.normalize(emb, p=2, dim=1)
+        else:
+            return F.normalize(feat, p=2, dim=1)
 
     def get_feature_norm(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -169,10 +173,13 @@ class DNNetV3(nn.Module):
         raw_norm is passed to MagFace as the magnitude signal ||f||.
         """
         feat     = self.backbone(x)
-        emb_raw  = self.head(feat)
+        if self.use_head:
+            emb_raw  = self.head(feat)
+        else:
+            emb_raw  = feat
         norm     = emb_raw.norm(p=2, dim=1, keepdim=True)  # (B, 1)
         emb_norm = emb_raw / norm
-        return emb_norm, norm.squeeze(1)                    # (B, 1024), (B,)
+        return emb_norm, norm.squeeze(1)                    # (B, D), (B,)
 
 
 # ==============================================================================

@@ -152,14 +152,32 @@ For a cloud-deployed system serving millions of requests:
 
 ---
 
-## ⚠️ Important: Delete Old Database
+## 🔄 UPDATE2: Batch Enrollment & Test-Time Augmentation Gallery Prep
 
-Since the database schema changed from one table to two tables, **you must delete your old `dog_biometrics.db` file** before running the updated app. The new schema will be created automatically on startup.
+### Overview
+In this update, we configured and executed the automated enrollment and robust augmentation pipeline for all dogs within the target folder (`nose_samples`). This ensures that the system is fully populated with both high-fidelity gallery embeddings and augmented variants to guard against real-world variance (zooms, distance, perspective distortion).
 
-```bash
-# Delete old database (run from the project folder)
-del dog_biometrics.db
+### 📁 Source Configuration Changes
+- **Pipeline Redirected**: Pointed both `enroll_gallery.py` and `augment_and_enroll.py` to `nose_samples` instead of the default `dog_samples` directory.
+- **Output Destination**: Programmed `augment_and_enroll.py` to save the resulting augmented images into a newly structured `nose_samples_augmented/` directory.
 
-# Then start the app
-streamlit run app.py
-```
+### 🚀 Gallery Enrollment Summary
+- **Original Dog Enrollment (`enroll_gallery.py`)**: 
+  - Automatically scanned `nose_samples/` directory and identified **41 unique dog images**.
+  - Processed them through the `DNNetV3` (TinyViT-21M) model, computing a 1024-d embedding vector per dog.
+  - Successfully registered all 41 original dog identities and initial embeddings in `dog_biometrics.db`.
+- **Robustness Augmentation & Registration (`augment_and_enroll.py`)**:
+  - Generated **3 augmented variants** for each of the 41 enrolled dogs:
+    1. **Zoomed In**: Central 75% crop scaled back to simulate the camera being positioned closer.
+    2. **Zoomed Out**: Adding 15% black padding scaled back to simulate the camera being further away.
+    3. **Reshaped/Resized**: Horizontal squeeze (80% width) with padded sides to simulate perspective stretch or angle tilt.
+  - Saved all 123 generated variant images inside `/nose_samples_augmented`.
+  - Processed and registered all 123 variant embeddings under their respective dog identities in `dog_biometrics.db`.
+
+### 🛡️ Robustness Impact
+Each registered dog profile now contains **4 distinct embeddings** (1 Original + 3 Augmented variants) in the database. Utilizing **Strategy B (Max Similarity)**, this ensures the verification system handles arbitrary camera zooms, distances, and tilt orientations seamlessly!
+
+
+
+
+
