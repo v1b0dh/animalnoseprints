@@ -1,164 +1,111 @@
 """
 batch_reenroll_student.py
 =========================
-Converts existing teacher-enrolled dogs to student embeddings WITHOUT
-re-photographing. Reads the stored photos from the database, runs them
-through the StudentDNNet model, and inserts new 512-d student embeddings.
+Adds a 512-d student embedding for every teacher embedding in the folder
+gallery at data/gallery/. Reads the stored JPEGs, runs StudentDNNet, and
+writes a parallel ``<idx>_student.npy`` file next to each ``<idx>.npy``.
 
-After running this, the Streamlit app's "Export Gallery for Mobile"
-feature will work immediately.
+After running this, ``<dog>/<idx>.npy``      -> 1024-d teacher
+                ``<dog>/<idx>_student.npy``  -> 512-d student
 
 Usage:
-    python batch_reenroll_student.py
-    python batch_reenroll_student.py --db dog_biometrics.db
-    python batch_reenroll_student.py --dry-run   # Preview only, no writes
+    python scripts/batch_reenroll_student.py
+    python scripts/batch_reenroll_student.py --gallery data/gallery
+    python scripts/batch_reenroll_student.py --dry-run
 """
 
 import argparse
-import io
-import sqlite3
-import struct
 import os
-from PIL import Image
+import sys
 
 import torch
 import torch.nn.functional as F
-import sys
+from PIL import Image
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../app')))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'app')))
 from det5 import StudentDNNet, CLAHEPipeline
 
 
-# ── Config ────────────────────────────────────────────────────────────────────
+DEFAULT_GALLERY = "data/gallery"
+DEFAULT_CKPT    = "checkpoints/student_best.pth"
 
-DEFAULT_DB  = "data/dog_biometrics.db"
-STUDENT_DIM = 512
-CKPT_PATH   = "checkpoints/student_best.pth"
-
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def load_student(ckpt_path: str) -> StudentDNNet:
     model = StudentDNNet(pretrained=True)
     if os.path.exists(ckpt_path):
-        print(f"  [✓] Loading distilled weights from: {ckpt_path}")
+        print(f"  [OK] Loading distilled weights from: {ckpt_path}")
         ckpt = torch.load(ckpt_path, map_location="cpu")
         sd = ckpt.get("model_state_dict", ckpt)
         model.load_state_dict(sd)
     else:
-        print(f"  [!] No checkpoint at '{ckpt_path}' -- using ImageNet-pretrained backbone.")
-        print(f"      Accuracy will be lower than a distilled model.")
+        print(f"  [WARN] No checkpoint at '{ckpt_path}' -- using ImageNet-pretrained backbone.")
+        print(f"         Accuracy will be lower than a distilled model.")
     model.eval()
     return model
 
 
-def embed_photo_bytes(photo_blob: bytes, model: StudentDNNet, pipeline: CLAHEPipeline) -> list[float]:
-    """Decode stored BLOB photo → run student inference → return float list."""
-    img = Image.open(io.BytesIO(photo_blob)).convert("RGB")
-    tensor, _ = pipeline(img)
-    tensor = tensor.unsqueeze(0)          # (1, 3, 224, 224)
-    with torch.no_grad():
-        emb = model(tensor)               # (1, 512) L2-normalized
-    return emb[0].tolist()
-
-
-def floats_to_blob(floats: list[float]) -> bytes:
-    return struct.pack(f"<{len(floats)}f", *floats)
-
-
-# ── Main ──────────────────────────────────────────────────────────────────────
-
-def run(db_path: str, dry_run: bool = False):
+def run(gallery_dir: str, dry_run: bool = False):
     print("=" * 60)
-    print("  DogID — Batch Student Re-enrollment")
+    print("  DogID - Batch Student Re-enrollment")
     print("=" * 60)
 
-    if not os.path.exists(db_path):
-        print(f"[ERROR] Database not found: {db_path}")
+    if not os.path.isdir(gallery_dir):
+        print(f"[ERROR] Gallery not found: {gallery_dir}")
         return
 
-    # 1. Load models
-    print("\n[1/4] Loading StudentDNNet …")
+    print("\n[1/4] Loading StudentDNNet ...")
     pipeline = CLAHEPipeline()
-    model    = load_student(CKPT_PATH)
+    model    = load_student(DEFAULT_CKPT)
 
-    # 2. Connect to DB
-    print(f"\n[2/4] Opening database: {db_path}")
-    conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA foreign_keys = ON")
-
-    # 3. Fetch all teacher-enrolled rows that have a photo stored
-    rows = conn.execute("""
-        SELECT e.id, d.name, e.photo, e.sharpness
-        FROM   embeddings e
-        JOIN   dogs d ON d.id = e.dog_id
-        WHERE  e.model_type = 'teacher'
-          AND  e.photo IS NOT NULL
-          AND  length(e.photo) > 0
-        ORDER  BY d.name, e.id
-    """).fetchall()
-
-    if not rows:
-        print("\n[!] No teacher embeddings with stored photos found.")
-        print("    Make sure photos were saved when you registered the dogs.")
-        conn.close()
+    print(f"\n[2/4] Scanning gallery: {gallery_dir}")
+    dogs = sorted(d for d in os.listdir(gallery_dir)
+                  if os.path.isdir(os.path.join(gallery_dir, d)))
+    if not dogs:
+        print("[!] No dogs found.")
         return
 
-    print(f"\n[3/4] Found {len(rows)} teacher embedding(s) to convert.\n")
-
-    skipped   = 0
-    converted = 0
-    errors    = 0
-
-    for emb_id, dog_name, photo_blob, sharpness in rows:
-        # Skip if a student embedding already exists for this exact embedding row
-        existing = conn.execute("""
-            SELECT COUNT(*) FROM embeddings
-            WHERE dog_id = (SELECT dog_id FROM embeddings WHERE id = ?)
-              AND model_type = 'student'
-        """, (emb_id,)).fetchone()[0]
-
-        if existing > 0:
-            print(f"  [i] {dog_name} (emb #{emb_id}) — student embedding already exists, skipping.")
-            skipped += 1
-            continue
-
-        try:
-            floats = embed_photo_bytes(photo_blob, model, pipeline)
-            blob   = floats_to_blob(floats)
-
-            if dry_run:
-                print(f"  [DRY] {dog_name} (emb #{emb_id}) -> would insert 512-d student embedding.")
-            else:
-                conn.execute("""
-                    INSERT INTO embeddings (dog_id, embedding, photo, sharpness, model_type)
-                    SELECT dog_id, ?, photo, ?, 'student'
-                    FROM   embeddings WHERE id = ?
-                """, (blob, sharpness, emb_id))
-                print(f"  [OK]  {dog_name} (emb #{emb_id}) -> converted to 512-d student embedding.")
-
-            converted += 1
-
-        except Exception as exc:
-            print(f"  [ERR] {dog_name} (emb #{emb_id}) - ERROR: {exc}")
-            errors += 1
-
-    # 4. Commit & summary
-    if not dry_run:
-        conn.commit()
-
-    conn.close()
+    skipped, converted, errors = 0, 0, 0
+    for dog in dogs:
+        d = os.path.join(gallery_dir, dog)
+        for fn in sorted(os.listdir(d)):
+            if not (fn.endswith(".npy") and not fn.endswith("_student.npy")):
+                continue
+            idx = fn[:4]
+            jpg = os.path.join(d, f"{idx}.jpg")
+            out = os.path.join(d, f"{idx}_student.npy")
+            if os.path.exists(out):
+                skipped += 1
+                continue
+            if not os.path.exists(jpg):
+                print(f"  [ERR] {dog}/{idx} - missing thumbnail")
+                errors += 1
+                continue
+            try:
+                img  = Image.open(jpg).convert("RGB")
+                t, _ = pipeline(img)
+                with torch.no_grad():
+                    emb = model(t.unsqueeze(0)).squeeze(0).cpu().numpy().astype("float32")
+                if dry_run:
+                    print(f"  [DRY] {dog}/{idx} -> would write 512-d student embedding")
+                else:
+                    import numpy as np
+                    np.save(out, emb)
+                    print(f"  [OK]  {dog}/{idx} -> 512-d student embedding")
+                converted += 1
+            except Exception as exc:
+                print(f"  [ERR] {dog}/{idx} - {exc}")
+                errors += 1
 
     print("\n" + "=" * 60)
     print(f"  Done!  Converted: {converted}  |  Skipped: {skipped}  |  Errors: {errors}")
     if not dry_run and converted > 0:
-        print("\n  [DONE] You can now use 'Export Gallery for Mobile' in the Streamlit app.")
+        print("\n  [DONE] Student embeddings are now alongside the teacher ones.")
     print("=" * 60)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Batch re-enroll dogs using StudentDNNet")
-    parser.add_argument("--db",      default=DEFAULT_DB, help=f"Path to SQLite database (default: {DEFAULT_DB})")
-    parser.add_argument("--dry-run", action="store_true", help="Preview without writing to DB")
-    args = parser.parse_args()
-    run(args.db, dry_run=args.dry_run)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--gallery", default=DEFAULT_GALLERY)
+    ap.add_argument("--dry-run", action="store_true")
+    args = ap.parse_args()
+    run(args.gallery, dry_run=args.dry_run)

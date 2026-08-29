@@ -275,6 +275,7 @@ class MagFaceLoss(nn.Module):
         embeddings : torch.Tensor,   # (B, D) — already L2-normalised
         norms      : torch.Tensor,   # (B,)   — raw ||f||
         labels     : torch.Tensor,   # (B,)
+        sharpness  : Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
 
         # Clamp norms to valid range
@@ -304,8 +305,16 @@ class MagFaceLoss(nn.Module):
         # Re-compute cosine with margin applied
         logits = self.s * torch.cos(theta_m)             # (B, C)
 
-        # Cross-entropy classification loss
-        loss_ce = F.cross_entropy(logits, labels)
+        # Weight each sample by measured image quality when it is available.
+        # Values <= 100 are treated as blurry and >= 500 as sharp.
+        loss_ce_per_sample = F.cross_entropy(logits, labels, reduction="none")
+        if sharpness is not None:
+            quality_weight = (sharpness.to(logits.device).float() - 100.0) / 400.0
+            quality_weight = quality_weight.clamp(0.0, 1.0).mul(0.5).add(0.5)
+            loss_ce = (loss_ce_per_sample * quality_weight).sum()
+            loss_ce = loss_ce / quality_weight.sum().clamp_min(1e-6)
+        else:
+            loss_ce = loss_ce_per_sample.mean()
 
         # MagFace regularisation (quality-awareness)
         loss_g = self.lambda_g * self._calc_regularisation(norms_clamped)
@@ -354,7 +363,7 @@ def train_one_epoch(
         if scaler is not None:
             with torch.cuda.amp.autocast():
                 emb_norm, raw_norm = model.get_feature_norm(images)
-                loss = magface(emb_norm, raw_norm, labels)
+                loss = magface(emb_norm, raw_norm, labels, sharpness_scores)
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(
@@ -364,7 +373,7 @@ def train_one_epoch(
             scaler.update()
         else:
             emb_norm, raw_norm = model.get_feature_norm(images)
-            loss = magface(emb_norm, raw_norm, labels)
+            loss = magface(emb_norm, raw_norm, labels, sharpness_scores)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(
                 list(model.parameters()) + list(magface.parameters()), max_norm=5.0
@@ -485,7 +494,9 @@ class DistillationLoss(nn.Module):
 
 def build_teacher(num_classes: int, pretrained: bool = True) -> Tuple[DNNetV3, MagFaceLoss]:
     """Convenience factory: returns (model, loss) for training."""
-    model   = DNNetV3(pretrained=pretrained)
+    # The MagFace classifier is configured for DNNetV3.EMBED_DIM (1024),
+    # so the 576 -> 1024 embedding head must be active.
+    model   = DNNetV3(pretrained=pretrained, use_head=True)
     loss_fn = MagFaceLoss(num_classes=num_classes, embed_dim=DNNetV3.EMBED_DIM)
     return model, loss_fn
 
