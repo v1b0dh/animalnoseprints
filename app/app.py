@@ -1,38 +1,59 @@
 """
-app.py — DogID System: 360° Video-Based Dog Nose Biometric Recognition
+app.py — DogID System: Dog Nose Biometric Recognition
 =======================================================================
-New workflow:
-  REGISTER : Upload a short 360° nose/face video → auto-extract frames →
-             quality-filter by sharpness → embed all good frames → store.
-  IDENTIFY : Upload a short video (or single photo) → multi-frame query →
-             ensemble max-cosine-similarity against all stored embeddings.
+Folder-based gallery (no database).
+
+Storage layout (under GALLERY_DIR, default "data/gallery/"):
+
+    <dog_name>/
+        0001.npy        # 1024-d teacher embedding (float32, L2-normalized)
+        0001.jpg        # thumbnail of the source photo
+        0002.npy
+        0002.jpg
+        ...
+        meta.json       # {breed, age_years, weight_kg, color, registered_at,
+                        #  emb_count, avg_sharpness, best_sharpness}
+
+Workflow:
+  REGISTER : Upload one or more nose photos → embed → save as .npy + .jpg.
+  IDENTIFY : Upload one or more nose photos → ensemble max-cosine match.
 """
 
+import io
+import os
+import json
+import time
+import base64
+from typing import Dict, List, Tuple, Optional
+
 import streamlit as st
-import sqlite3
 import torch
 import torch.nn.functional as F
 import numpy as np
-import io
-import os
-import pandas as pd
-from PIL import Image
+from PIL import Image, ImageStat
 
 from det5 import DNNetV3, CLAHEPipeline
-from video_utils import pil_frames_from_upload
+from nose_detector import NoseDetector
 
-DB_NAME          = "data/dog_biometrics.db"
-MATCH_THRESH     = 0.82       # Minimum cosine similarity to call a match
-QUALITY_WARN     = 100.0      # Sharpness below this → warn user
-VIDEO_MAX_FRAMES = 30         # Frames to evenly sample from video
-VIDEO_MIN_SHARP  = 100.0      # Minimum Laplacian score to keep a frame
-VIDEO_TOP_N      = 20         # Maximum frames to store per session
-VIDEO_MIN_PASS   = 5          # Minimum good frames required to proceed
+GALLERY_DIR    = "data/gallery"
+MATCH_THRESH   = 0.82
+QUALITY_WARN   = 100.0
+REGISTER_MIN_SHARPNESS = 100.0
+IDENTIFY_MIN_SHARPNESS = 60.0
+MIN_NOSE_CROP_SIDE = 80
+NOSE_DETECTOR_PATH = "checkpoints/nose_detector.onnx"
+NOSE_WEIGHT = 0.85
+FACE_WEIGHT = 0.15
+EMBED_DIM      = 1024
+SAFE_NAME_REPL = str.maketrans({c: "_" for c in r'<>:"/\|?*'})
 
-# ── Page config ────────────────────────────────────────────────────────────────
+
+# ==============================================================================
+# Page config + CSS
+# ==============================================================================
+
 st.set_page_config(page_title="DogID System", layout="wide", page_icon="🐾")
 
-# ── Global CSS ─────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
   @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap');
@@ -125,137 +146,237 @@ st.markdown("""
 
 
 # ==============================================================================
-# DATABASE HELPERS
+# Gallery I/O (folder of .npy files)
 # ==============================================================================
 
-def get_conn():
-    conn = sqlite3.connect(DB_NAME)
-    conn.row_factory = sqlite3.Row
-    return conn
+def safe_dirname(name: str) -> str:
+    """Make a dog name filesystem-safe."""
+    s = (name or "").strip().translate(SAFE_NAME_REPL)
+    while "__" in s:
+        s = s.replace("__", "_")
+    return s.strip("._") or "unnamed"
 
 
-def get_breeds():
-    conn = get_conn()
-    rows = conn.execute("SELECT id, breed_name FROM breeds ORDER BY breed_name").fetchall()
-    conn.close()
-    return rows
+def ensure_gallery_root() -> str:
+    os.makedirs(GALLERY_DIR, exist_ok=True)
+    return GALLERY_DIR
 
 
-def add_breed(name, origin="", weight=""):
-    conn = get_conn()
+def dog_dir(name: str) -> str:
+    return os.path.join(ensure_gallery_root(), safe_dirname(name))
+
+
+def list_dogs() -> List[str]:
+    root = ensure_gallery_root()
+    out = []
+    for entry in sorted(os.listdir(root)):
+        p = os.path.join(root, entry)
+        if os.path.isdir(p):
+            out.append(entry)
+    return out
+
+
+def list_breeds() -> List[str]:
+    """Collect distinct breeds from all dog meta.json files."""
+    breeds = set()
+    for d in list_dogs():
+        meta = read_meta(d)
+        if meta and meta.get("breed"):
+            breeds.add(meta["breed"])
+    return sorted(breeds)
+
+
+def read_meta(name: str) -> Optional[dict]:
+    p = os.path.join(dog_dir(name), "meta.json")
+    if not os.path.exists(p):
+        return None
     try:
-        conn.execute(
-            "INSERT INTO breeds (breed_name, origin, typical_weight_kg) VALUES (?,?,?)",
-            (name, origin, weight)
-        )
-        conn.commit()
+        with open(p, "r", encoding="utf-8") as f:
+            return json.load(f)
     except Exception:
-        pass
-    row = conn.execute("SELECT id FROM breeds WHERE breed_name=?", (name,)).fetchone()
-    conn.close()
-    return row["id"] if row else None
+        return None
 
 
-def get_owners():
-    conn = get_conn()
-    rows = conn.execute("SELECT id, name FROM owners ORDER BY name").fetchall()
-    conn.close()
-    return rows
+def write_meta(name: str, **kwargs) -> None:
+    p = os.path.join(dog_dir(name), "meta.json")
+    existing = {}
+    if os.path.exists(p):
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                existing = json.load(f)
+        except Exception:
+            existing = {}
+    existing.update({k: v for k, v in kwargs.items() if v is not None})
+    existing["name"] = name
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump(existing, f, indent=2, ensure_ascii=False)
 
 
-def add_owner(name, phone="", email="", address=""):
-    conn = get_conn()
-    cur  = conn.execute(
-        "INSERT INTO owners (name, phone, email, address) VALUES (?,?,?,?)",
-        (name, phone, email, address)
-    )
-    oid = cur.lastrowid
-    conn.commit()
-    conn.close()
-    return oid
+def next_index(name: str) -> int:
+    """Return the next available 4-digit index for a dog's embeddings."""
+    d = dog_dir(name)
+    if not os.path.isdir(d):
+        return 1
+    used = []
+    for fn in os.listdir(d):
+        if fn.endswith(".npy"):
+            try:
+                used.append(int(fn[:4]))
+            except ValueError:
+                pass
+    return (max(used) + 1) if used else 1
 
 
-def get_or_create_dog(name, breed_id=None, owner_id=None, age=None, weight=None, color=None):
-    conn = get_conn()
-    row  = conn.execute("SELECT id FROM dogs WHERE name=?", (name,)).fetchone()
-    if row:
-        dog_id = row["id"]
-    else:
-        cur    = conn.execute(
-            "INSERT INTO dogs (name, breed_id, owner_id, age_years, weight_kg, color) VALUES (?,?,?,?,?,?)",
-            (name, breed_id, owner_id, age, weight, color)
-        )
-        dog_id = cur.lastrowid
-        conn.commit()
-    conn.close()
-    return dog_id
+def save_embedding(name: str, embedding: torch.Tensor, pil_img: Image.Image,
+                   sharpness: float, original_img: Optional[Image.Image] = None,
+                   face_embedding: Optional[torch.Tensor] = None,
+                   crop_bbox: Optional[Tuple[int, int, int, int]] = None,
+                   detector_confidence: Optional[float] = None,
+                   detector_source: Optional[str] = None) -> str:
+    """Save one nose embedding + thumbnail; return the index used."""
+    d = dog_dir(name)
+    os.makedirs(d, exist_ok=True)
+    idx = next_index(name)
+    npy_path = os.path.join(d, f"{idx:04d}.npy")
+    jpg_path = os.path.join(d, f"{idx:04d}.jpg")
+    np.save(npy_path, embedding.detach().cpu().numpy().astype(np.float32))
 
+    if face_embedding is not None:
+        face_path = os.path.join(d, f"face_{idx:04d}.npy")
+        np.save(face_path, face_embedding.detach().cpu().numpy().astype(np.float32))
 
-def add_embedding(dog_id, embedding, photo_bytes, sharpness, model_type="teacher"):
-    blob = embedding.detach().cpu().numpy().astype(np.float32).tobytes()
-    conn = get_conn()
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute(
-        "INSERT INTO embeddings (dog_id, embedding, photo, sharpness, model_type) VALUES (?,?,?,?,?)",
-        (dog_id, blob, photo_bytes, float(sharpness), model_type)
-    )
-    conn.commit()
-    conn.close()
-
-
-def log_identification(dog_id, similarity, confirmed):
-    conn = get_conn()
-    conn.execute(
-        "INSERT INTO identifications (dog_id, similarity, confirmed) VALUES (?,?,?)",
-        (dog_id, float(similarity), confirmed)
-    )
-    conn.commit()
-    conn.close()
-
-
-def get_dog_gallery(model_type="teacher", breed_id=None):
-    """Return {dog_name: [embedding_tensor, ...]} from the DB."""
-    conn = get_conn()
-    
-    if breed_id is not None:
-        rows = conn.execute(
-            "SELECT d.name, e.embedding FROM dogs d "
-            "JOIN embeddings e ON e.dog_id = d.id WHERE e.model_type = ? AND d.breed_id = ?",
-            (model_type, breed_id)
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT d.name, e.embedding FROM dogs d "
-            "JOIN embeddings e ON e.dog_id = d.id WHERE e.model_type = ?",
-            (model_type,)
-        ).fetchall()
-        
-    conn.close()
-
-    gallery: dict = {}
-    for r in rows:
-        vec = np.frombuffer(r["embedding"], dtype=np.float32)
-        gallery.setdefault(r["name"], []).append(torch.from_numpy(vec.copy()))
-    return gallery
-
-
-def get_all_dog_names():
-    conn = get_conn()
-    rows = conn.execute("SELECT name FROM dogs ORDER BY name").fetchall()
-    conn.close()
-    return [r["name"] for r in rows]
-
-
-def img_to_bytes(img: Image.Image) -> bytes:
-    buf = io.BytesIO()
-    thumb = img.copy()
+    thumb = pil_img.copy()
     thumb.thumbnail((256, 256))
-    thumb.save(buf, format="JPEG", quality=85)
-    return buf.getvalue()
+    thumb.save(jpg_path, format="JPEG", quality=85)
+
+    if original_img is not None:
+        original_path = os.path.join(d, f"original_{idx:04d}.jpg")
+        original_thumb = original_img.copy()
+        original_thumb.thumbnail((768, 768))
+        original_thumb.save(original_path, format="JPEG", quality=88)
+
+    frame_meta_path = os.path.join(d, f"{idx:04d}.json")
+    with open(frame_meta_path, "w", encoding="utf-8") as f:
+        json.dump({
+            "idx": f"{idx:04d}",
+            "sharpness": float(sharpness),
+            "crop_bbox": crop_bbox,
+            "detector_confidence": detector_confidence,
+            "detector_source": detector_source,
+            "nose_weight": NOSE_WEIGHT,
+            "face_weight": FACE_WEIGHT,
+            "has_face_embedding": face_embedding is not None,
+            "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }, f, indent=2)
+
+    write_meta(name, last_sharpness=float(sharpness))
+    return f"{idx:04d}"
+
+
+def list_dog_frames(name: str) -> List[dict]:
+    """Return [{'idx': '0001', 'emb': np.ndarray, 'jpg': path, 'sharpness': float}, ...]"""
+    d = dog_dir(name)
+    if not os.path.isdir(d):
+        return []
+    frames = []
+    for fn in sorted(os.listdir(d)):
+        if not (fn.endswith(".npy") and fn[:4].isdigit()):
+            continue
+        idx = fn[:4]
+        try:
+            arr = np.load(os.path.join(d, fn))
+        except Exception:
+            continue
+        jpg = os.path.join(d, f"{idx}.jpg")
+        if not os.path.exists(jpg):
+            jpg = None
+        face_path = os.path.join(d, f"face_{idx}.npy")
+        face_emb = None
+        if os.path.exists(face_path):
+            try:
+                face_emb = np.load(face_path).astype(np.float32)
+            except Exception:
+                face_emb = None
+        frame_meta_path = os.path.join(d, f"{idx}.json")
+        frame_meta = {}
+        if os.path.exists(frame_meta_path):
+            try:
+                with open(frame_meta_path, "r", encoding="utf-8") as f:
+                    frame_meta = json.load(f)
+            except Exception:
+                frame_meta = {}
+        # No per-frame sharpness stored; approximate from meta (not ideal but ok).
+        frames.append({
+            "idx": idx,
+            "emb": arr.astype(np.float32),
+            "face_emb": face_emb,
+            "jpg": jpg,
+            "meta": frame_meta,
+        })
+    # Fill sharpness from meta if present (single global value, used as fallback)
+    meta = read_meta(name) or {}
+    for fr in frames:
+        fr["sharpness"] = fr.get("meta", {}).get("sharpness", meta.get("last_sharpness", 0.0))
+    return frames
+
+
+def delete_dog(name: str) -> None:
+    import shutil
+    d = dog_dir(name)
+    if os.path.isdir(d):
+        shutil.rmtree(d)
+
+
+def clear_dog_embeddings(name: str) -> None:
+    d = dog_dir(name)
+    if not os.path.isdir(d):
+        return
+    for fn in os.listdir(d):
+        if fn.endswith(".npy") or fn.endswith(".jpg") or (fn[:4].isdigit() and fn.endswith(".json")):
+            try:
+                os.remove(os.path.join(d, fn))
+            except Exception:
+                pass
+
+
+def build_gallery(model_type: str = "teacher",
+                  breed: Optional[str] = None
+                  ) -> Dict[str, Dict[str, List[torch.Tensor]]]:
+    """
+    Return {dog_name: {"nose": [tensor, ...], "face": [tensor, ...]}}.
+    `model_type` and `breed` filters are accepted for API compatibility with
+    the old SQLite version. The folder layout only stores the teacher
+    model, so `model_type` is informational. `breed` filters by meta.json.
+    """
+    out: Dict[str, Dict[str, List[torch.Tensor]]] = {}
+    for name in list_dogs():
+        meta = read_meta(name) or {}
+        if breed and meta.get("breed") != breed:
+            continue
+        nose_embs = []
+        face_embs = []
+        for fr in list_dog_frames(name):
+            nose_embs.append(torch.from_numpy(fr["emb"].copy()))
+            if fr.get("face_emb") is not None:
+                face_embs.append(torch.from_numpy(fr["face_emb"].copy()))
+        if nose_embs:
+            out[name] = {"nose": nose_embs, "face": face_embs}
+    return out
+
+
+def dog_stats(name: str) -> dict:
+    frames = list_dog_frames(name)
+    sharp = [f["sharpness"] for f in frames if f.get("sharpness", 0) > 0]
+    return {
+        "emb_count": len(frames),
+        "avg_sharpness": float(np.mean(sharp)) if sharp else 0.0,
+        "best_sharpness": float(np.max(sharp)) if sharp else 0.0,
+    }
 
 
 # ==============================================================================
-# MODEL
+# Model
 # ==============================================================================
 
 @st.cache_resource
@@ -276,64 +397,131 @@ def load_model():
 model, pipeline = load_model()
 
 
+@st.cache_resource
+def load_nose_detector():
+    return NoseDetector(weights_path=NOSE_DETECTOR_PATH)
+
+
+nose_detector = load_nose_detector()
+
+
 # ==============================================================================
-# INFERENCE HELPERS
+# Inference helpers
 # ==============================================================================
 
 def embed_pil(img: Image.Image):
-    """Embed a single PIL image → (tensor, sharpness)."""
+    """Embed a single PIL image -> (tensor, sharpness)."""
     t, s = pipeline(img)
     with torch.no_grad():
         vec = model(t.unsqueeze(0)).squeeze(0)
     return vec, s
 
 
-def embed_frame_list(frames_with_scores):
-    """
-    Embed a list of (PIL.Image, sharpness) frames.
-    Returns list of (embedding_tensor, sharpness, PIL.Image).
-    """
+def image_quality(img: Image.Image, sharpness: float, min_sharpness: float) -> Tuple[bool, List[str]]:
+    """Basic crop quality checks used before embedding."""
+    reasons = []
+    w, h = img.size
+    if min(w, h) < MIN_NOSE_CROP_SIDE:
+        reasons.append(f"nose crop is too small ({w}x{h})")
+    if sharpness < min_sharpness:
+        reasons.append(f"sharpness is low ({sharpness:.0f})")
+
+    gray = img.convert("L")
+    stat = ImageStat.Stat(gray)
+    brightness = stat.mean[0]
+    contrast = stat.stddev[0]
+    if brightness < 25:
+        reasons.append("nose crop is too dark")
+    elif brightness > 235:
+        reasons.append("nose crop is too bright")
+    if contrast < 8:
+        reasons.append("nose crop has very low contrast")
+
+    return len(reasons) == 0, reasons
+
+
+def prepare_sample(img: Image.Image, min_sharpness: float) -> dict:
+    """Detect/crop nose, score quality, and prepare embeddings."""
+    original = img.convert("RGB")
+    detected = nose_detector.detect_and_crop(original)
+    nose_vec, sharpness = embed_pil(detected.crop)
+    face_vec, _ = embed_pil(original)
+    quality_ok, quality_reasons = image_quality(detected.crop, sharpness, min_sharpness)
+
+    return {
+        "original": original,
+        "nose_crop": detected.crop,
+        "nose_vec": nose_vec,
+        "face_vec": face_vec,
+        "sharpness": sharpness,
+        "bbox": detected.bbox,
+        "detector_confidence": detected.confidence,
+        "detector_source": detected.source,
+        "quality_ok": quality_ok,
+        "quality_reasons": quality_reasons,
+    }
+
+
+def show_prepared_samples(samples: List[dict], max_show: int = 6) -> None:
+    subset = samples[:max_show]
+    if not subset:
+        return
+    cols = st.columns(len(subset))
+    for col, sample in zip(cols, subset):
+        with col:
+            st.image(sample["nose_crop"], width='stretch')
+            status = "OK" if sample["quality_ok"] else "WARN"
+            st.caption(
+                f"{status} sharp {sample['sharpness']:.0f} | "
+                f"{sample['detector_source']} {sample['detector_confidence']:.2f}"
+            )
+
+
+def max_cosine(query_vecs, emb_list) -> float:
+    best = 0.0
+    for qv in query_vecs:
+        for ev in emb_list:
+            sim = F.cosine_similarity(qv.unsqueeze(0), ev.unsqueeze(0)).item()
+            best = max(best, sim)
+    return best
+
+
+def weighted_identity_score(nose_score: float, face_score: Optional[float]) -> float:
+    if face_score is None:
+        return nose_score
+    return (NOSE_WEIGHT * nose_score) + (FACE_WEIGHT * face_score)
+
+
+def match_to_gallery(query_samples, gallery):
+    """Weighted ensemble match. Nose is primary; face is secondary when present."""
     results = []
-    for pil_img, sharpness in frames_with_scores:
-        vec, _ = embed_pil(pil_img)
-        results.append((vec, sharpness, pil_img))
-    return results
-
-
-def match_to_gallery(query_vecs, gallery):
-    """
-    Ensemble max-cosine-similarity: for each registered dog,
-    take the best similarity across ALL (query_frame × stored_embedding) pairs.
-
-    Returns a list of (name, best_sim) sorted descending.
-    """
-    results = []
-    for name, emb_list in gallery.items():
-        best = 0.0
-        for qv in query_vecs:
-            for ev in emb_list:
-                sim  = F.cosine_similarity(qv.unsqueeze(0), ev.unsqueeze(0)).item()
-                best = max(best, sim)
-        results.append((name, best))
+    query_nose = [s["nose_vec"] for s in query_samples]
+    query_face = [s["face_vec"] for s in query_samples if s.get("face_vec") is not None]
+    for name, emb_groups in gallery.items():
+        nose_score = max_cosine(query_nose, emb_groups["nose"])
+        face_score = None
+        if query_face and emb_groups.get("face"):
+            face_score = max_cosine(query_face, emb_groups["face"])
+        final_score = weighted_identity_score(nose_score, face_score)
+        results.append((name, final_score, nose_score, face_score))
     results.sort(key=lambda x: x[1], reverse=True)
     return results
 
 
-def render_frame_strip(frames_with_scores, max_show: int = 8):
-    """Render a horizontal thumbnail strip with sharpness badges."""
-    subset = frames_with_scores[:max_show]
+def render_frame_strip(pil_sharp_pairs, max_show: int = 8):
+    subset = pil_sharp_pairs[:max_show]
     if not subset:
         return
     cols = st.columns(len(subset))
     for col, (pil_img, score) in zip(cols, subset):
         with col:
-            st.image(pil_img, use_container_width=True)
-            icon = "🟢" if score > 300 else ("🟡" if score > 150 else "🔴")
+            st.image(pil_img, width='stretch')
+            icon = "OK" if score > 300 else (".." if score > 150 else "!!")
             st.caption(f"{icon} {score:.0f}")
 
 
 # ==============================================================================
-# SIDEBAR NAVIGATION
+# Sidebar
 # ==============================================================================
 
 with st.sidebar:
@@ -344,176 +532,140 @@ with st.sidebar:
     st.divider()
     choice = st.radio(
         "nav",
-        ["🔍 Identify", "📝 Register", "⚙️ Manage", "📊 Database"],
+        ["Identify", "Register", "Manage", "Database"],
         label_visibility="collapsed"
     )
     st.divider()
-    st.caption("DNNetV3 · TinyViT-21M · MagFace")
+    st.caption("DNNetV3 - TinyViT-21M - MagFace")
 
 
 # ==============================================================================
-# PAGE — IDENTIFY
+# Page: IDENTIFY
 # ==============================================================================
 
-if choice == "🔍 Identify":
+if choice == "Identify":
     st.header("Identify Dog")
-    st.caption("Upload a video or photos of the dog's nose to find a match.")
+    st.caption("Upload one or more dog photos. The app crops the nose before matching.")
 
-    tab_vid, tab_photo = st.tabs(["Video", "Photo Upload"])
+    query_samples: list = []
 
-    query_vecs:   list = []
-    query_frames: list = []   # (PIL, sharpness)
+    uploaded_photos = st.file_uploader(
+        "Upload one or more dog images",
+        type=["jpg", "png", "jpeg"],
+        accept_multiple_files=True,
+        key="id_img_up",
+    )
+    if uploaded_photos:
+        imgs = [Image.open(f).convert("RGB") for f in uploaded_photos]
+        thumb_cols = st.columns(min(len(imgs), 6))
+        for col, img in zip(thumb_cols, imgs):
+            col.image(img, width='stretch')
+        with st.spinner("Processing photos..."):
+            for img in imgs:
+                sample = prepare_sample(img, IDENTIFY_MIN_SHARPNESS)
+                if not sample["quality_ok"]:
+                    st.caption("Image quality warning: " + "; ".join(sample["quality_reasons"]))
+                query_samples.append(sample)
+        st.markdown('<div class="section-hdr">Detected Nose Crops</div>', unsafe_allow_html=True)
+        show_prepared_samples(query_samples)
+        if not nose_detector.has_model:
+            st.info("No nose detector weights found yet, so the app is using a center-crop fallback.")
+        st.caption(f"{len(imgs)} photo(s) loaded.")
 
-    # ── VIDEO TAB ─────────────────────────────────────────────────────────────
-    with tab_vid:
-        vid_file = st.file_uploader(
-            "Upload a short nose/face video",
-            type=["mp4", "mov", "avi", "mkv"],
-            key="id_vid",
-            help="5–15 seconds is ideal. Keep the camera steady."
-        )
-        if vid_file:
-            with st.spinner("Extracting frames and scoring quality…"):
-                good_frames, total_extracted = pil_frames_from_upload(
-                    vid_file.read(),
-                    max_frames=VIDEO_MAX_FRAMES,
-                    min_sharpness=VIDEO_MIN_SHARP,
-                    top_n=VIDEO_TOP_N,
-                )
-
-            qa1, qa2, qa3 = st.columns(3)
-            qa1.metric("Frames Sampled",   total_extracted)
-            qa2.metric("Quality Passed",   len(good_frames))
-            qa3.metric("Querying With",    min(len(good_frames), VIDEO_TOP_N))
-
-            if len(good_frames) < VIDEO_MIN_PASS:
-                st.error(
-                    f"❌ Only **{len(good_frames)}** usable frame(s) found "
-                    f"(minimum {VIDEO_MIN_PASS}). "
-                    "Try recording in better lighting or holding the camera steadier."
-                )
-            else:
-                st.success(f"✅ {len(good_frames)} quality frame(s) ready.")
-                st.markdown("**Sample frames (best sharpness first):**")
-                render_frame_strip(good_frames, max_show=8)
-
-                with st.spinner("Generating embeddings…"):
-                    embedded     = embed_frame_list(good_frames)
-                    query_vecs   = [e[0] for e in embedded]
-                    query_frames = good_frames
-
-    # ── PHOTO TAB ─────────────────────────────────────────────────────────────
-    with tab_photo:
-        uploaded_photos = st.file_uploader(
-            "Upload one or more nose images",
-            type=["jpg", "png", "jpeg"],
-            accept_multiple_files=True,
-            key="id_img_up",
-        )
-        if uploaded_photos:
-            imgs = [Image.open(f).convert("RGB") for f in uploaded_photos]
-            # Show thumbnails
-            thumb_cols = st.columns(min(len(imgs), 6))
-            for col, img in zip(thumb_cols, imgs):
-                col.image(img, use_container_width=True)
-            # Embed all uploaded photos
-            with st.spinner("Processing photos…"):
-                for img in imgs:
-                    vec, s = embed_pil(img)
-                    if s < QUALITY_WARN:
-                        st.caption(f"Low sharpness ({s:.0f}) on one image — may affect accuracy.")
-                    query_vecs.append(vec)
-                    query_frames.append((img, s))
-            st.caption(f"{len(imgs)} photo(s) loaded.")
-
-    # ── FILTER & MATCHING ─────────────────────────────────────────────────────
-    if query_vecs:
+    if query_samples:
         st.divider()
-        
+
         st.markdown('<div class="section-hdr">Filter Search (Optional)</div>', unsafe_allow_html=True)
-        breeds_rows = get_breeds()
-        b_names     = [r["breed_name"] for r in breeds_rows]
-        b_ids       = [r["id"]         for r in breeds_rows]
-        
-        filter_breed_id = None
-        if b_names:
+        breeds = list_breeds()
+        filter_breed = None
+        if breeds:
             c_filter, _ = st.columns([1, 1])
             with c_filter:
-                filter_b = st.selectbox("Narrow search by breed", ["All Breeds"] + b_names)
-                if filter_b != "All Breeds":
-                    filter_breed_id = b_ids[b_names.index(filter_b)]
-                    
-        gallery = get_dog_gallery(breed_id=filter_breed_id)
+                filter_breed = st.selectbox("Narrow search by breed", ["All Breeds"] + breeds)
+                if filter_breed == "All Breeds":
+                    filter_breed = None
+
+        gallery = build_gallery(breed=filter_breed)
 
         if not gallery:
-            st.error("No dogs registered yet. Head to **📝 Register** to add one.")
+            st.error("No dogs registered yet. Head to **Register** to add one.")
         else:
-            with st.spinner("Matching against gallery…"):
-                results = match_to_gallery(query_vecs, gallery)
+            with st.spinner("Matching against gallery..."):
+                results = match_to_gallery(query_samples, gallery)
 
             st.subheader("Top Matches")
             top3 = results[:3]
-            cols = st.columns(3)
-            for i, (name, sim) in enumerate(top3):
+            cols = st.columns(len(top3))
+            for i, (name, sim, nose_sim, face_sim) in enumerate(top3):
                 with cols[i]:
                     st.metric(label=name, value=f"{sim*100:.1f}%")
+                    face_text = "n/a" if face_sim is None else f"{face_sim*100:.1f}%"
+                    st.caption(f"nose {nose_sim*100:.1f}% | face {face_text}")
                     if i == 0:
                         if sim >= MATCH_THRESH:
                             st.success("Match")
                         else:
                             st.error("No match")
 
-            top_name, top_sim = top3[0]
+            top_name, top_sim, _top_nose_sim, _top_face_sim = top3[0]
             st.divider()
 
             if top_sim >= MATCH_THRESH:
-                if st.button("✅ Confirm & Log Match", type="primary", key="confirm_match"):
-                    conn = get_conn()
-                    row  = conn.execute("SELECT id FROM dogs WHERE name=?", (top_name,)).fetchone()
-                    if row:
-                        log_identification(row["id"], top_sim, 1)
-                        st.success(f"Identification of **{top_name}** logged.")
-                    conn.close()
+                st.success(f"Best match: **{top_name}** ({top_sim*100:.1f}%)")
+                if st.button("Confirm match", type="primary", key="confirm_match"):
+                    log_dir = os.path.join(GALLERY_DIR, "_logs")
+                    os.makedirs(log_dir, exist_ok=True)
+                    log_path = os.path.join(log_dir, "identifications.log")
+                    with open(log_path, "a", encoding="utf-8") as f:
+                        f.write(f"{int(time.time())}\t{top_name}\t{top_sim:.4f}\t1\n")
+                    st.success(f"Identification of **{top_name}** logged.")
             else:
                 st.warning(
-                    "❌ **No confident match found.** "
+                    "No confident match found. "
                     "The closest match is below the identification threshold."
                 )
                 st.markdown(
-                    "**Know who this is?** Link these frames to their record "
+                    "Know who this is? Link these frames to their record "
                     "to improve future recognition accuracy."
                 )
-                all_names = get_all_dog_names()
+                all_names = list_dogs()
                 if all_names:
                     rc1, rc2 = st.columns([3, 1])
                     with rc1:
                         selected = st.selectbox("Select dog", all_names, key="no_match_select")
                     with rc2:
                         st.write(""); st.write("")
-                        if st.button("➕ Add Frames", type="primary", key="no_match_add"):
-                            conn = get_conn()
-                            row  = conn.execute("SELECT id FROM dogs WHERE name=?", (selected,)).fetchone()
-                            if row:
-                                dog_id = row["id"]
-                                for vec, sharpness, pil_img in embed_frame_list(query_frames)[:5]:
-                                    add_embedding(dog_id, vec, img_to_bytes(pil_img), sharpness)
-                                log_identification(dog_id, top_sim, 1)
-                                st.success(f"✅ Frames added to **{selected}**'s record!")
-                                st.balloons()
-                            conn.close()
+                        if st.button("Add Frames", type="primary", key="no_match_add"):
+                            for sample in query_samples[:5]:
+                                save_embedding(
+                                    selected,
+                                    sample["nose_vec"],
+                                    sample["nose_crop"],
+                                    sample["sharpness"],
+                                    original_img=sample["original"],
+                                    face_embedding=sample["face_vec"],
+                                    crop_bbox=sample["bbox"],
+                                    detector_confidence=sample["detector_confidence"],
+                                    detector_source=sample["detector_source"],
+                                )
+                            log_dir = os.path.join(GALLERY_DIR, "_logs")
+                            os.makedirs(log_dir, exist_ok=True)
+                            with open(os.path.join(log_dir, "identifications.log"), "a", encoding="utf-8") as f:
+                                f.write(f"{int(time.time())}\t{selected}\t{top_sim:.4f}\t1\n")
+                            st.success(f"Frames added to **{selected}**'s record!")
+                            st.balloons()
                 else:
-                    st.info("No dogs in the database yet.")
+                    st.info("No dogs in the gallery yet.")
 
 
 # ==============================================================================
-# PAGE — REGISTER
+# Page: REGISTER
 # ==============================================================================
 
-elif choice == "📝 Register":
+elif choice == "Register":
     st.header("Register Dog")
-    st.caption("Add a new dog to the system using a video or photos of their nose.")
+    st.caption("Add a new dog. Full-face photos are cropped to the nose before saving.")
 
-    # ── Dog Details ────────────────────────────────────────────────────────────
     st.markdown('<div class="section-hdr">Dog Details</div>', unsafe_allow_html=True)
     c1, c2 = st.columns(2)
     name   = c1.text_input("Name", placeholder="e.g. Buddy")
@@ -522,13 +674,10 @@ elif choice == "📝 Register":
     color  = c3.text_input("Color / Markings", placeholder="e.g. Golden")
     weight = c4.number_input("Weight (kg)", min_value=0.0, step=0.5)
 
-    # ── Breed ──────────────────────────────────────────────────────────────────
     st.markdown('<div class="section-hdr">Breed</div>', unsafe_allow_html=True)
-    breeds_rows = get_breeds()
-    b_names     = [r["breed_name"] for r in breeds_rows]
-    b_ids       = [r["id"]         for r in breeds_rows]
-    nb_toggle   = st.toggle("Add a new breed")
-    breed_id    = None
+    existing_breeds = list_breeds()
+    nb_toggle = st.toggle("Add a new breed")
+    breed: Optional[str] = None
 
     if nb_toggle:
         nb1, nb2, nb3 = st.columns(3)
@@ -536,205 +685,166 @@ elif choice == "📝 Register":
         nb_origin = nb2.text_input("Origin",     key="nb_origin")
         nb_weight = nb3.text_input("Typical Weight", key="nb_weight")
         if nb_name:
-            breed_id = add_breed(nb_name, nb_origin, nb_weight)
-            st.success(f"Breed '{nb_name}' added.")
+            breed = nb_name.strip()
+            st.success(f"Breed '{breed}' will be saved.")
     else:
-        if b_names:
-            sel_b    = st.selectbox("Breed", b_names)
-            breed_id = b_ids[b_names.index(sel_b)]
+        if existing_breeds:
+            breed = st.selectbox("Breed", existing_breeds)
         else:
-            st.caption("No breeds yet — toggle above to add one.")
+            st.caption("No breeds yet - toggle above to add one.")
 
-    owner_id = None
-
-    # ── Upload ─────────────────────────────────────────────────────────────────
     st.markdown('<div class="section-hdr">Upload</div>', unsafe_allow_html=True)
+    reg_frames: list = []
 
-    reg_frames: list = []   # (PIL.Image, sharpness)
+    uploaded_photos = st.file_uploader(
+        "Upload one or more dog images",
+        type=["jpg", "png", "jpeg"],
+        accept_multiple_files=True,
+        key="reg_img_up",
+    )
+    if uploaded_photos:
+        imgs = [Image.open(f).convert("RGB") for f in uploaded_photos]
+        thumb_cols = st.columns(min(len(imgs), 6))
+        for col, img in zip(thumb_cols, imgs):
+            col.image(img, width='stretch')
+        for img in imgs:
+            sample = prepare_sample(img, REGISTER_MIN_SHARPNESS)
+            if not sample["quality_ok"]:
+                st.caption("Registration quality warning: " + "; ".join(sample["quality_reasons"]))
+            reg_frames.append(sample)
+        st.markdown('<div class="section-hdr">Detected Nose Crops</div>', unsafe_allow_html=True)
+        show_prepared_samples(reg_frames)
+        if not nose_detector.has_model:
+            st.info("No nose detector weights found yet, so the app is using a center-crop fallback.")
+        st.caption(f"{len(imgs)} photo(s) loaded.")
 
-    vid_tab, photo_tab = st.tabs(["Video", "Photo Upload"])
-
-    with vid_tab:
-        vid_file = st.file_uploader(
-            "Upload video (mp4, mov, avi, mkv)",
-            type=["mp4", "mov", "avi", "mkv"],
-            key="reg_vid",
-        )
-        if vid_file:
-            with st.spinner(f"Sampling up to {VIDEO_MAX_FRAMES} frames and checking quality…"):
-                good_frames, total_extracted = pil_frames_from_upload(
-                    vid_file.read(),
-                    max_frames=VIDEO_MAX_FRAMES,
-                    min_sharpness=VIDEO_MIN_SHARP,
-                    top_n=VIDEO_TOP_N,
-                )
-
-            qa1, qa2, qa3 = st.columns(3)
-            qa1.metric("Frames Sampled", total_extracted)
-            qa2.metric("Quality Passed", len(good_frames),
-                       delta=f"min {VIDEO_MIN_PASS} needed")
-            qa3.metric("Will Store",     min(len(good_frames), VIDEO_TOP_N))
-
-            if len(good_frames) < VIDEO_MIN_PASS:
-                st.error(
-                    f"❌ Only **{len(good_frames)}** usable frame(s) "
-                    f"(need at least {VIDEO_MIN_PASS}). "
-                    "Record in brighter conditions or hold the camera steadier."
-                )
-            else:
-                st.success(f"✅ {len(good_frames)} quality frame(s) extracted!")
-                st.markdown("**Preview — best frames by sharpness:**")
-                render_frame_strip(good_frames, max_show=8)
-                reg_frames = good_frames
-
-    with photo_tab:
-        uploaded_photos = st.file_uploader(
-            "Upload one or more nose images",
-            type=["jpg", "png", "jpeg"],
-            accept_multiple_files=True,
-            key="reg_img_up",
-        )
-        if uploaded_photos:
-            imgs = [Image.open(f).convert("RGB") for f in uploaded_photos]
-            thumb_cols = st.columns(min(len(imgs), 6))
-            for col, img in zip(thumb_cols, imgs):
-                col.image(img, use_container_width=True)
-            for img in imgs:
-                _, s = pipeline(img)
-                if s < QUALITY_WARN:
-                    st.caption(f"Low sharpness ({s:.0f}) on one image.")
-                reg_frames.append((img, s))
-            st.caption(f"{len(imgs)} photo(s) loaded.")
-
-    # ── Register Button ───────────────────────────────────────────────────────
     st.divider()
     if reg_frames:
-        n = len(reg_frames)
-        st.markdown(f"**Ready to register with {n} frame(s).** Click below to process and save.")
+        good_frames = [f for f in reg_frames if f["quality_ok"]]
+        st.markdown(f"**Ready to register with {len(good_frames)} usable frame(s).** Click below to save.")
         if st.button("Register Dog", type="primary", key="reg_save"):
             if not name:
                 st.error("Please enter a dog name first.")
+            elif not good_frames:
+                st.error("No uploaded image passed the registration quality checks.")
             else:
-                dog_id = get_or_create_dog(
-                    name,
-                    breed_id,
-                    None,
-                    age    or None,
-                    weight or None,
-                    color  or None,
+                safe = safe_dirname(name)
+                # Write / update meta.json first so the directory is initialized.
+                write_meta(
+                    safe,
+                    breed=breed,
+                    age_years=age or None,
+                    weight_kg=weight or None,
+                    color=color or None,
+                    registered_at=time.strftime("%Y-%m-%d %H:%M:%S"),
+                    nose_weight=NOSE_WEIGHT,
+                    face_weight=FACE_WEIGHT,
+                    nose_detector_path=NOSE_DETECTOR_PATH,
+                    nose_detector_active=nose_detector.has_model,
                 )
-                prog = st.progress(0, text="Embedding frames…")
-                for i, (pil_img, sharpness) in enumerate(reg_frames):
-                    t, _ = pipeline(pil_img)
-                    with torch.no_grad():
-                        vec = model(t.unsqueeze(0)).squeeze(0)
-                    add_embedding(dog_id, vec, img_to_bytes(pil_img), sharpness)
-                    prog.progress((i + 1) / n, text=f"Embedding frame {i+1}/{n}…")
+                prog = st.progress(0, text="Embedding frames...")
+                for i, sample in enumerate(good_frames):
+                    save_embedding(
+                        safe,
+                        sample["nose_vec"],
+                        sample["nose_crop"],
+                        sample["sharpness"],
+                        original_img=sample["original"],
+                        face_embedding=sample["face_vec"],
+                        crop_bbox=sample["bbox"],
+                        detector_confidence=sample["detector_confidence"],
+                        detector_source=sample["detector_source"],
+                    )
+                    prog.progress((i + 1) / len(good_frames), text=f"Saving frame {i+1}/{len(good_frames)}...")
                 prog.empty()
-                st.success(f"{name} registered with {n} frame(s).")
+                st.success(f"{name} registered with {len(good_frames)} frame(s) -> data/gallery/{safe}/")
                 st.balloons()
     else:
-        st.caption("Upload a video or photos above to enable registration.")
+        st.caption("Upload photos above to enable registration.")
 
 
 # ==============================================================================
-# PAGE — MANAGE
+# Page: MANAGE
 # ==============================================================================
 
-elif choice == "⚙️ Manage":
+elif choice == "Manage":
     st.header("Manage Dogs")
     st.caption("View and manage dog records and their stored embeddings.")
 
-    conn = get_conn()
-    dogs = conn.execute("""
-        SELECT
-            d.id,
-            d.name,
-            d.registered_at,
-            COUNT(e.id)               AS emb_count,
-            ROUND(AVG(e.sharpness),1) AS avg_sharpness,
-            ROUND(MAX(e.sharpness),1) AS best_sharpness
-        FROM dogs d
-        LEFT JOIN embeddings e ON e.dog_id = d.id AND e.model_type = 'teacher'
-        GROUP BY d.id
-        ORDER BY d.name
-    """).fetchall()
-    conn.close()
-
+    dogs = list_dogs()
     if not dogs:
-        st.info("No dogs registered yet. Head to **📝 Register** to add one.")
+        st.info("No dogs registered yet. Head to **Register** to add one.")
     else:
-        st.markdown(f"**{len(dogs)} dog(s) in the database**")
+        st.markdown(f"**{len(dogs)} dog(s) in the gallery**")
         st.write("")
 
-        for d in dogs:
+        for name in dogs:
+            meta = read_meta(name) or {}
+            stats = dog_stats(name)
+            breed_str = meta.get("breed") or "Unknown breed"
             label = (
-                f"🐕 **{d['name']}**  —  "
-                f"{d['emb_count']} frame(s) stored  |  "
-                f"Avg sharpness: {d['avg_sharpness'] or 0:.1f}"
+                f"{name} - {breed_str} - "
+                f"{stats['emb_count']} frame(s) - "
+                f"Avg sharpness: {stats['avg_sharpness']:.1f}"
             )
             with st.expander(label):
                 mc1, mc2, mc3 = st.columns(3)
-                mc1.metric("Frame Embeddings", d["emb_count"])
-                mc2.metric("Avg Sharpness",    f"{d['avg_sharpness'] or 0:.1f}")
-                mc3.metric("Best Sharpness",   f"{d['best_sharpness'] or 0:.1f}")
-                st.caption(f"Registered: {d['registered_at']}")
+                mc1.metric("Frame Embeddings", stats["emb_count"])
+                mc2.metric("Avg Sharpness",    f"{stats['avg_sharpness']:.1f}")
+                mc3.metric("Best Sharpness",   f"{stats['best_sharpness']:.1f}")
+                st.caption(f"Registered: {meta.get('registered_at', '-')}")
+
+                # Show a small strip of thumbnails.
+                frames = list_dog_frames(name)
+                jpgs = [f["jpg"] for f in frames if f["jpg"]]
+                if jpgs:
+                    imgs = [Image.open(j) for j in jpgs[:8]]
+                    strip = st.columns(len(imgs))
+                    for col, img in zip(strip, imgs):
+                        col.image(img, width='stretch')
 
                 st.divider()
                 b1, b2 = st.columns(2)
-
                 with b1:
-                    if st.button(
-                        "🗑️ Clear Embeddings Only",
-                        key=f"clr_{d['id']}",
-                        help="Remove all stored frames but keep the dog record."
-                    ):
-                        c = get_conn()
-                        c.execute(
-                            "DELETE FROM embeddings WHERE dog_id=? AND model_type='teacher'",
-                            (d["id"],)
-                        )
-                        c.commit(); c.close()
-                        st.warning(
-                            f"All embeddings cleared for **{d['name']}**. "
-                            "Record is preserved — re-register a video to restore."
-                        )
+                    if st.button("Clear Embeddings Only",
+                                 key=f"clr_{name}",
+                                 help="Remove all stored frames but keep the dog record."):
+                        clear_dog_embeddings(name)
+                        st.warning(f"All embeddings cleared for **{name}**. "
+                                   "Record is preserved.")
                         st.rerun()
-
                 with b2:
-                    if st.button(
-                        f"❌ Delete {d['name']} Entirely",
-                        key=f"del_{d['id']}",
-                        help="Permanently delete this dog and all their embeddings."
-                    ):
-                        c = get_conn()
-                        c.execute("PRAGMA foreign_keys = ON")
-                        c.execute("DELETE FROM dogs WHERE id=?", (d["id"],))
-                        c.commit(); c.close()
+                    if st.button(f"Delete {name} Entirely",
+                                 key=f"del_{name}",
+                                 help="Permanently delete this dog and all their embeddings."):
+                        delete_dog(name)
                         st.rerun()
 
 
 # ==============================================================================
-# PAGE — DATABASE
+# Page: DATABASE
 # ==============================================================================
 
-elif choice == "📊 Database":
-    st.header("Database")
+elif choice == "Database":
+    st.header("Gallery")
+    st.caption(f"Folder: `{GALLERY_DIR}/`")
 
-    conn    = get_conn()
-    n_dogs  = conn.execute("SELECT COUNT(*) FROM dogs").fetchone()[0]
-    n_own   = conn.execute("SELECT COUNT(*) FROM owners").fetchone()[0]
-    n_embs  = conn.execute(
-        "SELECT COUNT(*) FROM embeddings WHERE model_type='teacher'"
-    ).fetchone()[0]
-    n_ids   = conn.execute("SELECT COUNT(*) FROM identifications").fetchone()[0]
-    conn.close()
+    dogs   = list_dogs()
+    breeds = list_breeds()
+    n_embs = 0
+    for d in dogs:
+        n_embs += dog_stats(d)["emb_count"]
+    n_logs = 0
+    log_path = os.path.join(GALLERY_DIR, "_logs", "identifications.log")
+    if os.path.exists(log_path):
+        with open(log_path, "r", encoding="utf-8") as f:
+            n_logs = sum(1 for _ in f)
 
     c1, c2, c3, c4 = st.columns(4)
     for col, num, label in zip(
         [c1, c2, c3, c4],
-        [n_dogs, n_own, n_embs, n_ids],
-        ["Dogs", "Owners", "Frame Embeddings", "Identifications"],
+        [len(dogs), len(breeds), n_embs, n_logs],
+        ["Dogs", "Breeds", "Frame Embeddings", "Identifications"],
     ):
         col.markdown(
             f'<div class="stat-card">'
@@ -746,24 +856,20 @@ elif choice == "📊 Database":
 
     st.divider()
     st.subheader("Per-Dog Summary")
-
-    conn = get_conn()
-    rows = conn.execute("""
-        SELECT
-            d.name                         AS "Name",
-            COUNT(e.id)                    AS "Frames Stored",
-            ROUND(AVG(e.sharpness), 1)     AS "Avg Sharpness",
-            ROUND(MAX(e.sharpness), 1)     AS "Best Sharpness",
-            d.registered_at                AS "Registered At"
-        FROM dogs d
-        LEFT JOIN embeddings e ON e.dog_id = d.id AND e.model_type='teacher'
-        GROUP BY d.id
-        ORDER BY COUNT(e.id) DESC
-    """).fetchall()
-    conn.close()
-
-    if rows:
-        df = pd.DataFrame([dict(r) for r in rows])
-        st.dataframe(df, use_container_width=True, hide_index=True)
+    if dogs:
+        import pandas as pd
+        rows = []
+        for d in dogs:
+            meta  = read_meta(d) or {}
+            stats = dog_stats(d)
+            rows.append({
+                "Name":          d,
+                "Breed":         meta.get("breed", "-"),
+                "Frames Stored": stats["emb_count"],
+                "Avg Sharpness": round(stats["avg_sharpness"], 1),
+                "Best Sharpness": round(stats["best_sharpness"], 1),
+                "Registered At": meta.get("registered_at", "-"),
+            })
+        st.dataframe(pd.DataFrame(rows), width='stretch', hide_index=True)
     else:
         st.info("No data yet.")
