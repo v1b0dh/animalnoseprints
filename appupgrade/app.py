@@ -87,7 +87,7 @@ with st.sidebar:
 
 # -- Main Tabs --
 st.markdown('<div class="main-header">?? DogID v2: Video Registration & Hybrid Biometrics</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub-header">Register dogs via quick video clips • Identify dogs from single query photos</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">Register dogs via quick video clips Â• Identify dogs from single query photos</div>', unsafe_allow_html=True)
 
 tab_register, tab_identify, tab_gallery = st.tabs([
     "?? Video Registration", 
@@ -296,7 +296,7 @@ with tab_gallery:
                 with open(meta_p, "r") as f:
                     meta = json.load(f)
 
-            with st.expander(f"?? {meta.get('dog_name', dog)} — ({meta.get('breed', 'Unknown')}, {meta.get('frame_count', '?')} frames)"):
+            with st.expander(f"?? {meta.get('dog_name', dog)} Â— ({meta.get('breed', 'Unknown')}, {meta.get('frame_count', '?')} frames)"):
                 st.json(meta)
                 
                 # Show thumbnails
@@ -304,4 +304,4 @@ with tab_gallery:
                 t_cols = st.columns(min(6, max(1, len(jpgs))))
                 for i, jf in enumerate(jpgs[:12]):
                     with t_cols[i % 6]:
-                        st.image(os.path.join(dog_p, jf), caption=jf, width=120)
+                        st.image(os.path.join(dog_p, jf), caption=jf, width=120)
