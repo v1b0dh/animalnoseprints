@@ -86,7 +86,7 @@ def run_benchmark(
         emb = extract_embedding(crop_res.crop, model, pipeline)
         gallery_embeddings[dog_id] = emb
 
-    print(f'  [✓] Enrolled {len(gallery_embeddings)} reference embeddings.')
+    print(f'  [OK] Enrolled {len(gallery_embeddings)} reference embeddings.')
 
     print('\n[3/4] Running Identification on Augmented Probes...')
     aug_files = sorted([f for f in os.listdir(aug_dir) if f.lower().endswith(('.jpg', '.jpeg', '.png'))])
@@ -148,9 +148,9 @@ def run_benchmark(
     far_rejection = (correctly_rejected_unknowns / total_open_probes * 100) if total_open_probes else 0.0
 
     print(f'  CLOSED-SET IDENTIFICATION ({total_closed_probes} probes across {len(gallery_dog_ids)} dogs): ')
-    print(f'    • Rank-1 Accuracy (Exact Match & Cosine >= {threshold}): {rank1_acc:.2f}% ({correct_rank1}/{total_closed_probes})')
-    print(f'    • Rank-3 Accuracy (Within Top 3):                  {rank3_acc:.2f}% ({correct_rank3}/{total_closed_probes})')
-    print(f'    • Average Positive Cosine Score:                   {np.mean(closed_scores):.4f}')
+    print(f'    * Rank-1 Accuracy (Exact Match & Cosine >= {threshold}): {rank1_acc:.2f}% ({correct_rank1}/{total_closed_probes})')
+    print(f'    * Rank-3 Accuracy (Within Top 3):                  {rank3_acc:.2f}% ({correct_rank3}/{total_closed_probes})')
+    print(f'    * Average Positive Cosine Score:                   {np.mean(closed_scores):.4f}')
     
     print('\n  AUGMENTATION BREAKDOWN (Rank-1 Accuracy):')
     for atype, stats in aug_breakdown.items():
@@ -160,8 +160,8 @@ def run_benchmark(
         print(f"    - {atype:<15}: {acc:6.2f}% ({corr}/{tot})")
 
     print(f'\n  OPEN-SET REJECTION ({total_open_probes} unknown dog probes from {len(unknown_dog_ids)} dogs):')
-    print(f'    • Correct Unknown Rejection (Cosine < {threshold}):    {far_rejection:.2f}% ({correctly_rejected_unknowns}/{total_open_probes})')
-    print(f'    • Average Unknown Max-Cosine Score:                {np.mean(open_scores) if open_scores else 0.0:.4f}')
+    print(f'    * Correct Unknown Rejection (Cosine < {threshold}):    {far_rejection:.2f}% ({correctly_rejected_unknowns}/{total_open_probes})')
+    print(f'    * Average Unknown Max-Cosine Score:                {np.mean(open_scores) if open_scores else 0.0:.4f}')
 
     print('=' * 75)
 
