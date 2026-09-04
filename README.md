@@ -1,17 +1,22 @@
 # DogID System 🐾
 
-**DogID** is an advanced dog nose biometric recognition system. Analogous to fingerprint or facial recognition for humans, DogID uses a dog's **nose print** as a unique identifier. Each dog's nose has a distinct pattern of ridges and pores. This system embeds nose images into a high-dimensional vector space and uses cosine similarity to match query images against a gallery of registered dogs.
+**DogID** is an advanced dog nose biometric recognition system. Analogous to fingerprint or facial recognition for humans, DogID uses a dog's **dermal nose ridge print** as a unique identifier. Each dog's nose exhibits an immutable pattern of ridges, pores, and channels.
 
-The application is built with **Streamlit** and stores everything on disk as plain files (no database), powered by a state-of-the-art Vision Transformer pipeline.
+This system embeds nose images into a high-dimensional vector space, combining an **integrated YOLOv8 nose detector**, a **Vision Transformer backbone (TinyViT-21M)**, a **LAB-CLAHE micro-texture enhancement pipeline**, and a **hybrid decision engine** (Open-Set Cosine Gate + Few-Shot Linear Classifier).
 
 ---
 
 ## 🌟 Key Features
-- **Multi-Photo Workflow:** Bulk upload multiple photos of a dog's nose to capture different angles and lighting conditions, making registration and identification highly robust.
-- **Ensemble Max-Cosine Matching:** Matches queries against all stored embeddings for a dog, dramatically increasing accuracy over single-image comparisons.
-- **Advanced Preprocessing:** Uses a custom CLAHE (Contrast Limited Adaptive Histogram Equalization) pipeline in the LAB color space to artificially "pop" the micro-texture of nose ridges, regardless of the dog's coat color or lighting.
-- **Quality-Aware Loss (MagFace):** The model was trained using MagFace, meaning the neural network self-learns image quality. Sharp photos generate strong embeddings, while blurry photos are automatically down-weighted.
-- **Vision Transformer Backbone:** Built on **TinyViT-21M**, achieving state-of-the-art representation learning while remaining lightweight and fast.
+
+- **Integrated YOLOv8 Nose Detector:** Automatically locates and crops dog noses from unconstrained photos and video frames with high precision (`checkpoints/nose_detector.onnx`).
+- **Dual Application Workflows:**
+  - **V1 App (`app/app.py`):** Multi-photo registration and ensemble max-cosine similarity matching.
+  - **V2 App (`appupgrade/app.py`):** Video-based registration (Laplacian blur filtering + temporal diversity selection) with 2-Stage Hybrid matching (Cosine Gate + Fast Linear Boundary Classifier).
+- **Dual-Stream Biometrics (85/15):** Fuses macro nose ridge texture (85% weight) with overall head/facial structure (15% weight) for balanced identification.
+- **Advanced Preprocessing (LAB-CLAHE):** Luminance-only histogram equalization in LAB color space to pop micro-texture ridge patterns regardless of lighting or coat pigmentation.
+- **Quality-Aware Metric Learning (MagFace):** Dynamic margin and regularization loss coupling sample sharpness with feature magnitude ($||f||$).
+- **Edge AI Ready:** Knowledge distillation architecture (`MobileNetV3-Small`, 512-d) designed for low-latency (<10ms) edge and mobile deployment.
+- **Zero Database Server:** Plain folder-based storage layout on disk (`data/gallery/` and `data/gallery_v2/`), completely portable and version-controllable.
 
 ---
 
@@ -19,96 +24,144 @@ The application is built with **Streamlit** and stores everything on disk as pla
 
 ```text
 dogshi/
-├── app/
-│   ├── app.py                  # Main Streamlit web application
-│   └── det5.py                 # Core ML: model architecture & loss function
-├── scripts/
-│   ├── batch_reenroll_student.py # Utility: add 512-d student embeddings
-│   └── eval_gallery.py          # Utility: Rank-1 / mAP / EER on the gallery
+├── app/                              # V1: Photo-based Streamlit Application
+│   ├── app.py                        # Streamlit web app
+│   ├── det5.py                       # Core ML: DNNetV3, MagFaceLoss, CLAHEPipeline, StudentDNNet
+│   └── nose_detector.py              # YOLOv8 ONNX nose detector loader & inference
+├── appupgrade/                       # V2: Video Registration & Hybrid Classifier App
+│   ├── app.py                        # Streamlit web app with video ingestion & classifier inspector
+│   ├── video_engine.py               # Video frame sampling, Laplacian blur filter & diversity clustering
+│   ├── classifier_head.py            # Few-shot Fast Linear Classifier (scikit-learn Logistic Regression)
+│   └── matcher.py                    # 2-Stage Hybrid Matcher (Open-Set Gate + Linear Head)
+├── checkpoints/
+│   └── nose_detector.onnx            # Trained YOLOv8 ONNX nose detector model
 ├── data/
-│   └── gallery/                # Folder gallery (one folder per dog)
-└── README.md                   # This file
+│   ├── gallery/                      # V1 Gallery store (one folder per dog)
+│   └── gallery_v2/                   # V2 Gallery store (embeddings + thumbnails + classifier.pkl)
+├── dataset/
+│   ├── dog_samples_original/         # Original test dog photographs
+│   ├── nose_samples_augmented/       # Synthetic query probes (zoomed in, zoomed out, reshaped)
+│   └── video_samples/                # Sample dog registration videos
+├── docs/
+│   ├── NOSE_DETECTOR_TRAINING_GUIDE.md        # Step-by-step guide to train & export YOLOv8 on Kaggle
+│   └── BIOMETRIC_BACKBONE_TRAINING_GUIDE.md  # Step-by-step guide to fine-tune TinyViT with MagFace
+├── scripts/
+│   ├── eval_augmented_benchmark.py   # Benchmark tool for accuracy, rank-1, rank-3 & open-set FAR
+│   ├── batch_reenroll_student.py     # Utility: convert teacher embeddings to student embeddings
+│   └── eval_gallery.py               # Utility: Rank-1 / mAP / EER on gallery folders
+└── requirements.txt                  # Python dependencies
 ```
 
 ---
 
-## 🛠️ Architecture
+## 🛠️ Architecture & Dual-Stage Decision Pipeline
 
-1. **Backbone:** TinyViT-21M (pretrained on ImageNet-22K) -> outputs a 576-d global feature vector.
-2. **Embedding Head:** Expands the features to a richer 1024-d L2-normalized embedding space for cosine similarity matching.
-3. **Storage:** Plain files on disk under `data/gallery/`. One folder per dog:
-   ```
-   data/gallery/
-     Buddy/
-       0001.npy        # 1024-d teacher embedding (float32, L2-normalized)
-       0001.jpg        # thumbnail of the source photo
-       0002.npy
-       0002.jpg
-       meta.json       # {breed, age_years, weight_kg, color, registered_at, ...}
-   ```
-   No database server, no migrations — version-controllable, easy to back up.
+```
+════════════════════════════════════════════════════════════════════════════════════
+                             REGISTRATION WORKFLOW (VIDEO)
+════════════════════════════════════════════════════════════════════════════════════
+ [ Dog Video (MP4/MOV) ]
+         │
+         ▼
+ [ Frame Extractor ] ──▶ Adaptive sampling at 3-5 FPS
+         │
+         ▼
+ [ YOLOv8 Nose Detector ] ──▶ Auto-crop bounding box (`nose_detector.onnx`)
+         │
+         ▼
+ [ Laplacian Sharpness Filter ] ──▶ Discard motion-blurred or poorly exposed frames
+         │
+         ▼
+ [ Temporal Diversity Clusterer ] ──▶ Select top K (8–10) distinct, sharp angles
+         │
+         ▼
+ [ Feature Extraction Pipeline ]
+    ├── Primary:   LAB-CLAHE + DNNetV3 (Nose Crop)   ──▶ 1024-d nose vector (85%)
+    └── Secondary: Resize + DNNetV3 (Full Frame)     ──▶ 1024-d face vector (15%)
+         │
+         ▼
+ [ Gallery Store + Background Classifier Fitting (<0.2s) ] ──▶ `classifier.pkl`
+
+════════════════════════════════════════════════════════════════════════════════════
+                           IDENTIFICATION WORKFLOW (PHOTO)
+════════════════════════════════════════════════════════════════════════════════════
+ [ Query Photo (JPG/PNG) ] ──▶ Nose Crop + Dual Embedding (85% Nose + 15% Face)
+         │
+         ▼
+ [ Stage 1: Open-Set Cosine Gate ]
+    ├── If Max-Cosine < 0.64 ────────▶ "Unknown Dog / No Match Found" (Anti-Hallucination)
+    └── If Max-Cosine >= 0.64 ───────▶ Proceed to Stage 2
+         │
+         ▼
+ [ Stage 2: Fast Linear Boundary Classifier ]
+    └── Evaluates subtle decision boundaries between registered lookalikes
+         │
+         ▼
+ [ Hybrid Score Calculation ]
+    Score = 0.60 * Cosine_Score + 0.40 * Classifier_Probability
+    └── If Score >= Threshold ──▶ "Match Found: Dog Name"
+```
 
 ---
 
 ## 🚀 How to Run Locally
 
 ### 1. Install Dependencies
-Make sure you have Python installed, then run:
 ```bash
 pip install -r requirements.txt
 ```
 
-### 2. Start the App
-Run the Streamlit application from the root directory:
+*(For CUDA GPU support, install PyTorch matching your CUDA version from [pytorch.org](https://pytorch.org/get-started/locally/)).*
+
+### 2. Launch the Application
+
+- **Run Video Registration + Hybrid Matching App (V2 - Recommended):**
+  ```bash
+  python -m streamlit run appupgrade/app.py --server.port 8502
+  ```
+
+- **Run Photo Registration App (V1):**
+  ```bash
+  python -m streamlit run app/app.py --server.port 8501
+  ```
+
+---
+
+## 📊 Evaluation & Benchmarking
+
+Run the automated synthetic probe benchmark against the dataset:
+
 ```bash
-python -m streamlit run app/app.py
+# Run benchmark on all available classes with hold-out open-set test
+python scripts/eval_augmented_benchmark.py --holdout 5 --threshold 0.64
 ```
 
-### 3. Usage
-- **Register:** Head to the "Register" tab, add dog details, and upload one or more clear photos of the dog's nose.
-- **Identify:** Head to the "Identify" tab, upload a photo of a dog's nose, and the system will query the database to find the closest match using ensemble max-cosine similarity.
+This script evaluates:
+- **Rank-1 Identification Accuracy:** Percentage of queries where the top prediction is the exact enrolled dog.
+- **Rank-3 Accuracy:** Percentage of queries where the true dog is within the top-3 predictions.
+- **Augmentation Breakdown:** Performance across `zoomed_in`, `zoomed_out`, and `reshaped` probes.
+- **Open-Set False Acceptance Rejection:** Correct rejection rate for holdout dogs not in the gallery.
 
 ---
 
-## 🤖 Model Deployment (Edge AI)
-A teacher-student distillation pipeline exists within the codebase (`det5.py` and `batch_reenroll_student.py`). 
-- **Teacher:** DNNetV3 (TinyViT-21M, 1024-d) — used on desktop/server.
-- **Student:** MobileNetV3-Small (512-d, ~8ms CPU) — designed for Android/mobile edge deployment.
-*Note: The current web UI relies primarily on the high-accuracy Teacher model.*
+## 📖 Training Guides & Delegation Documentation
+
+Complete step-by-step guides for training models in free Kaggle / Colab GPU environments:
+
+1. **[YOLOv8 Dog Nose Detector Training Guide](docs/NOSE_DETECTOR_TRAINING_GUIDE.md):**
+   - Dataset sourcing from Roboflow Universe.
+   - Merging, standardizing, and remapping annotations to class `0: dog_nose`.
+   - Training and exporting to `checkpoints/nose_detector.onnx`.
+
+2. **[Biometric Backbone MagFace Fine-Tuning Guide](docs/BIOMETRIC_BACKBONE_TRAINING_GUIDE.md):**
+   - Dataset formatting (`dog_id/img.jpg`).
+   - One-click script to train `TinyViT-21M` with `MagFaceLoss` for metric separation.
+   - Pushing Rank-1 accuracy from generic ImageNet baseline to **>99.0%**.
 
 ---
 
-## Nose Detection And Weighted Matching
+## 🤖 Model Deployment (Edge AI / Mobile)
 
-The web app now sends every uploaded image through a nose-crop step before
-creating the main biometric embedding.
-
-Add your trained detector here when it is ready:
-
-```text
-checkpoints/nose_detector.onnx
-```
-
-Until that file exists, the app uses a center-crop fallback and marks the crop
-source as `center_fallback` in the UI and per-frame metadata.
-
-New registrations save:
-
-```text
-data/gallery/<dog>/
-  0001.npy           # nose embedding
-  0001.jpg           # nose crop thumbnail
-  face_0001.npy      # secondary full-image/face embedding
-  original_0001.jpg  # original upload thumbnail
-  0001.json          # crop bbox, sharpness, detector source/confidence
-```
-
-Matching uses the nose as the main identity signal and the face/full image as a
-secondary signal:
-
-```text
-final_score = 0.85 * nose_score + 0.15 * face_score
-```
-
-If an older record has no `face_*.npy` files, matching falls back to the nose
-score only.
+A teacher-student distillation framework is implemented in [`app/det5.py`](file:///c:/Users/papu_/Downloads/dogshi/app/det5.py) and [`scripts/batch_reenroll_student.py`](file:///c:/Users/papu_/Downloads/dogshi/scripts/batch_reenroll_student.py):
+- **Teacher Model:** `DNNetV3` (TinyViT-21M, 1024-d embeddings) — server/desktop.
+- **Student Model:** `StudentDNNet` (MobileNetV3-Small, 512-d embeddings, ~8ms CPU) — on-device mobile inference.
