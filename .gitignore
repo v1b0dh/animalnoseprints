@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Streamlit
+.streamlit/secrets.toml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDEs
+.vscode/
+.idea/
+
+# Heavy / generated artefacts
+*.onnx.bak
+checkpoints/*.pth
+data/gallery/
+data/gallery_v2/
+data/_logs/
+
+# Archived / legacy
+_archive/
