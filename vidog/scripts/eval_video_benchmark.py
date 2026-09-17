@@ -35,6 +35,7 @@ def run_evaluation(
     target_fps: float = 2.5,
     min_sharpness: float = 40.0,
     test_queries_per_video: int = 4,
+    min_sharpness: float = 35.0,
     open_set_count: int = 10,
     cosine_threshold: float = 0.64,
     random_seed: int = 42
@@ -44,6 +45,8 @@ def run_evaluation(
 
     print("=" * 85)
     print("   DOGID V2: ALL-7-VIDEO REGISTRATION & HELD-OUT FRAME EVALUATION")
+    print("   DOGID V2: HIGH-DENSITY VIDEO REGISTRATION & HELD-OUT BENCHMARK")
+    print("   Ratio: ~33% Frames Enrolled (e.g. 100/300) | ~10% Unseen Frames Tested (e.g. 30/300)")
     print("=" * 85)
 
     # 1. Load ML Pipeline & Nose Detector
@@ -73,12 +76,33 @@ def run_evaluation(
         target_k_frames=target_k_frames_per_video
     )
 
+    #    - Registration selects ~33% of video frames (e.g., 100 out of 300)
+    #    - Identification extracts ~10% of unused held-out frames (e.g., 30 out of 300)
+    print("\n[2/5] Enrolling ~33% Frames per Video & Sourcing ~10% Unused Held-Out Test Frames...")
     enrolled_frames = []
     test_heldout_frames = []
 
     for vid in videos:
         vp = os.path.join(video_dir, vid)
         
+        cap = cv2.VideoCapture(vp)
+        fc = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        dur = fc / max(fps, 1.0)
+        cap.release()
+
+        # Proportional frame budget matching user request:
+        # e.g., 300 frames -> 100 registration frames, 30 test frames
+        reg_k = max(6, int(round(fc / 3.0)))
+        test_k = max(2, int(round(fc / 10.0)))
+        sample_fps = max(6.0, float(reg_k * 1.5) / max(dur, 1.0))
+
+        engine = VideoRegistrationEngine(
+            target_fps=sample_fps,
+            min_sharpness=min_sharpness,
+            target_k_frames=reg_k
+        )
+
         # A. Registration extraction
         reg_frames, stats = engine.process_video(vp, nose_detector_fn=detector.detect_and_crop)
         enrolled_indices = set(f.frame_idx for f in reg_frames)
@@ -97,6 +121,7 @@ def run_evaluation(
             # Pick candidates with a buffer (>= 3 frames away from any registered frame)
             if all(abs(cur_idx - reg_idx) >= 3 for reg_idx in enrolled_indices):
                 # Quick sharpness check to avoid testing on unusable pure black/motion-blur frames
+            if cur_idx not in enrolled_indices:
                 gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
                 sh = compute_sharpness(gray)
                 if sh >= min_sharpness:
@@ -107,6 +132,7 @@ def run_evaluation(
 
         # Randomly sample held-out test frames from unused candidates
         sample_k = min(test_queries_per_video, len(unused_candidates))
+        sample_k = min(test_k, len(unused_candidates))
         chosen = random.sample(unused_candidates, sample_k) if sample_k > 0 else []
 
         for c_idx, c_pil, c_sh in chosen:
@@ -123,8 +149,10 @@ def run_evaluation(
             })
 
         print(f"  [{vid}]: {len(reg_frames)} registered frames | {len(chosen)} unused held-out test frames selected (from {len(unused_candidates)} available)")
+        print(f"  [{vid}]: {len(reg_frames)} registered (target={reg_k}) | {len(chosen)} unseen test frames (target={test_k}, available={len(unused_candidates)})")
 
     print(f"\n  [OK] Total Enrolled Gallery Frames for 'Dogo': {len(enrolled_frames)}")
+    print(f"\n  [OK] Total Enrolled Gallery Frames for 'Dogo': {len(enrolled_frames)} (from 815 total video frames)")
     print(f"  [OK] Total Unused Held-Out Query Frames for 'Dogo': {len(test_heldout_frames)}")
 
     # 4. Extract Gallery Embeddings (85% Nose + 15% Face)
@@ -273,5 +301,6 @@ if __name__ == '__main__':
         phodog_orig_dir=phodog_orig,
         target_k_frames_per_video=8,
         test_queries_per_video=4,
+        min_sharpness=35.0,
         cosine_threshold=0.64
     )
