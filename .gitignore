@@ -23,5 +23,10 @@ data/gallery/
 data/gallery_v2/
 data/_logs/
 
+# Video files with spaces in names (legacy and new)
+vidog/dataset/video_samples/dogo/VID_20260810_*.mp4
+vidog/dataset/video_samples/dogo/dogid*.mp4
+
 # Archived / legacy
+_kilo/
 _archive/

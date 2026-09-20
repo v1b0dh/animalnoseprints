@@ -1,4 +1,5 @@
 import os
+import json
 import numpy as np
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
@@ -13,6 +14,7 @@ class MatchCandidate:
     hybrid_score: float
     best_matching_frame: str
     status: str  # 'MATCH', 'LOW_CONFIDENCE', 'UNKNOWN'
+    gender: Optional[str] = None
 
 class HybridBiometricMatcher:
     """
@@ -42,10 +44,22 @@ class HybridBiometricMatcher:
     def reload_classifier(self):
         self.classifier.load()
 
+    def _get_dog_gender(self, dog: str) -> Optional[str]:
+        meta_path = os.path.join(self.gallery_dir, dog, "meta.json")
+        if os.path.exists(meta_path):
+            try:
+                with open(meta_path, "r", encoding="utf-8") as f:
+                    meta = json.load(f)
+                return meta.get("gender")
+            except Exception:
+                pass
+        return None
+
     def match(
         self,
         query_nose_emb: np.ndarray,
-        query_face_emb: Optional[np.ndarray] = None
+        query_face_emb: Optional[np.ndarray] = None,
+        gender: Optional[str] = None
     ) -> Tuple[Optional[MatchCandidate], List[MatchCandidate]]:
         if not os.path.exists(self.gallery_dir):
             return None, []
@@ -55,6 +69,29 @@ class HybridBiometricMatcher:
 
         if not dogs:
             return None, []
+
+        # -- Gender Filtering --
+        if gender is not None:
+            filtered_dogs = []
+            for dog in dogs:
+                meta_path = os.path.join(self.gallery_dir, dog, "meta.json")
+                dog_gender = None
+                if os.path.exists(meta_path):
+                    try:
+                        with open(meta_path, "r", encoding="utf-8") as f:
+                            meta = json.load(f)
+                        dog_gender = meta.get("gender")
+                    except Exception:
+                        pass
+                # Include dog if gender matches, or if meta has no gender (backward compatibility)
+                if dog_gender is None or dog_gender.lower() == gender.lower():
+                    filtered_dogs.append(dog)
+            
+            # If no dogs match the gender filter, fall back to all dogs
+            if filtered_dogs:
+                dogs = filtered_dogs
+            else:
+                print(f"[WARN] No dogs match gender filter '{gender}', falling back to all dogs")
 
         q_nose = query_nose_emb.flatten().astype(np.float32)
         q_nose_norm = np.linalg.norm(q_nose)
@@ -115,25 +152,33 @@ class HybridBiometricMatcher:
 
         max_overall_cosine = max(dog_cosine_scores.values()) if dog_cosine_scores else -1.0
 
-        # -- Step 2: Open-Set Cosine Gate --
-        # If max cosine is below gate threshold, reject immediately as Unknown Dog
-        if max_overall_cosine < self.open_set_threshold:
-            candidates = [
-                MatchCandidate(
-                    dog_name=dog,
-                    cosine_score=dog_cosine_scores[dog],
-                    classifier_prob=0.0,
-                    hybrid_score=dog_cosine_scores[dog],
-                    best_matching_frame=dog_best_frames[dog],
-                    status="UNKNOWN"
-                )
-                for dog in sorted(dogs, key=lambda d: dog_cosine_scores[d], reverse=True)
-            ]
-            return None, candidates
+            # -- Step 2: Open-Set Cosine Gate --
+            # If max cosine is below gate threshold, reject immediately as Unknown Dog
+            if max_overall_cosine < self.open_set_threshold:
+                candidates = [
+                    MatchCandidate(
+                        dog_name=dog,
+                        cosine_score=dog_cosine_scores[dog],
+                        classifier_prob=0.0,
+                        hybrid_score=dog_cosine_scores[dog],
+                        best_matching_frame=dog_best_frames[dog],
+                        status="UNKNOWN",
+                        gender=self._get_dog_gender(dog)
+                    )
+                    for dog in sorted(dogs, key=lambda d: dog_cosine_scores[d], reverse=True)
+                ]
+                return None, candidates
 
         # -- Step 3: Run Fast Linear Classifier --
         clf_probs = self.classifier.predict_proba(q_nose)
         use_clf = self.classifier.is_trained() and bool(clf_probs)
+
+        # -- Filter classifier probabilities to only gender-matched dogs --
+        if use_clf and gender is not None:
+            clf_probs = {
+                dog: prob for dog, prob in clf_probs.items()
+                if dog in dogs
+            }
 
         candidates: List[MatchCandidate] = []
         for dog in dogs:
@@ -158,7 +203,8 @@ class HybridBiometricMatcher:
                 classifier_prob=p_score if use_clf else -1.0,
                 hybrid_score=h_score,
                 best_matching_frame=dog_best_frames.get(dog, ""),
-                status=status
+                status=status,
+                gender=self._get_dog_gender(dog)
             ))
 
         candidates.sort(key=lambda c: c.hybrid_score, reverse=True)
