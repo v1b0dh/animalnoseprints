@@ -9,9 +9,10 @@ This system embeds nose images into a high-dimensional vector space, combining a
 ## 🌟 Key Features
 
 - **Integrated YOLOv8 Nose Detector:** Automatically locates and crops dog noses from unconstrained photos and video frames with high precision (`checkpoints/nose_detector.onnx`).
-- **Dual Application Workflows:**
+- **Triple Application Workflows:**
   - **V1 App (`phodog/app.py`):** Multi-photo registration and ensemble max-cosine similarity matching.
-  - **V2 App (`vidog/app.py`):** Video-based registration (Laplacian blur filtering + temporal diversity selection) with 2-Stage Hybrid matching (Cosine Gate + Fast Linear Boundary Classifier).
+  - **V2 App - Pure Cosine (`vidog_pure_cosine_similarity/app.py`):** Video registration (50 diverse sharp frames) + pure ensemble max-cosine matching (Zero classifier retraining).
+  - **V2 App - Hybrid Classifier (`vidog_train_model/app.py`):** Video registration + 2-Stage Hybrid matching (Cosine Gate + Fast Linear Boundary Classifier retraining).
 - **Dual-Stream Biometrics (85/15):** Fuses macro nose ridge texture (85% weight) with overall head/facial structure (15% weight) for balanced identification.
 - **Advanced Preprocessing (LAB-CLAHE):** Luminance-only histogram equalization in LAB color space to pop micro-texture ridge patterns regardless of lighting or coat pigmentation.
 - **Quality-Aware Metric Learning (MagFace):** Dynamic margin and regularization loss coupling sample sharpness with feature magnitude ($||f||$).
@@ -127,10 +128,16 @@ pip install -r requirements.txt
 
 There are two app versions available:
 
-#### V2 — Video Registration + Hybrid Matching (Recommended)
+#### V2 (Pure Cosine) — Video Registration + Pure Cosine (Recommended)
 
 ```bash
-cd vidog && streamlit run app.py --server.port 8502
+cd vidog_pure_cosine_similarity && streamlit run app.py --server.port 8502
+```
+
+#### V2 (Train Model) — Video Registration + Fast Linear Boundary Classifier
+
+```bash
+cd vidog_train_model && streamlit run app.py --server.port 8503
 ```
 
 This is the advanced app. Register a dog by uploading a short video clip — it auto-extracts sharp, diverse nose frames, computes dual-stream embeddings (85% nose + 15% face), and fits a few-shot logistic regression classifier.

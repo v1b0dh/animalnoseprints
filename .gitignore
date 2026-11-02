@@ -30,3 +30,9 @@ vidog/dataset/video_samples/dogo/dogid*.mp4
 # Archived / legacy
 _kilo/
 _archive/
+
+# Local datasets and papers
+paper/
+datasets/
+.kilo/
+

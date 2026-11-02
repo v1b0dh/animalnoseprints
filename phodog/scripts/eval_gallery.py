@@ -31,7 +31,7 @@ import numpy as np
 import torch
 from PIL import Image
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'app')))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from det5 import DNNetV3, CLAHEPipeline
 
 
