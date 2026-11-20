@@ -1,12 +1,13 @@
 import os
 import io
 import time
+import json
 import shutil
 import tempfile
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 import numpy as np
 from PIL import Image
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -15,7 +16,11 @@ from nose_detector import NoseDetector
 from video_engine import VideoRegistrationEngine
 from matcher import PureCosineMatcher
 
-app = FastAPI(title="Vidog Dual-Stream Biometric Service", version="2.5")
+app = FastAPI(
+    title="Vidog Zero-Friction Biometric Service",
+    description="Drop-in 2-endpoint REST API for PFA Portal. No video or image files are saved to disk; only compact vector matrices and metadata are stored.",
+    version="3.0"
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -32,8 +37,8 @@ NOSE_DETECTOR_PATH = os.path.join(CHECKPOINTS_DIR, "nose_detector.onnx")
 
 os.makedirs(GALLERY_DIR, exist_ok=True)
 
-# Preload models into memory
-print("[INIT] Loading DNNetV3 backbone and YOLO snout detector...")
+# 1. Warm-up models in memory
+print("[INIT] Pre-loading TinyViT biometric backbone & YOLO snout detector...")
 pipeline = CLAHEPipeline(image_size=224)
 model = DNNetV3(pretrained=True, use_head=True)
 model.eval()
@@ -47,7 +52,7 @@ matcher = PureCosineMatcher(
     nose_weight=0.80,
     body_weight=0.20
 )
-print("[INIT] Models ready for dual-stream registration and identification.")
+print("[INIT] Ready for real-time registration and identification.")
 
 def extract_features(img_pil: Image.Image, nose_pil: Optional[Image.Image] = None):
     import torch
@@ -63,159 +68,213 @@ def extract_features(img_pil: Image.Image, nose_pil: Optional[Image.Image] = Non
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "detector_ready": nose_detector.has_model}
+    return {
+        "status": "healthy",
+        "engine": "vidog_pure_cosine_similarity",
+        "detector_loaded": nose_detector.has_model,
+        "gallery_dogs_count": len([d for d in os.listdir(GALLERY_DIR) if os.path.isdir(os.path.join(GALLERY_DIR, d)) and not d.startswith('_')]) if os.path.exists(GALLERY_DIR) else 0
+    }
 
+# ==============================================================================
+# CALL 1: REGISTRATION ENDPOINT
+# ==============================================================================
 @app.post("/api/v1/register")
-async def register_dog(
+async def register(
+    request: Request,
+    case_id: str = Form(..., description="Unique case identifier from portal"),
+    dog_name: Optional[str] = Form("Unknown"),
+    metadata: Optional[str] = Form(None, description="Optional raw JSON string of form details"),
+    # Direct field bindings
     nose_video: Optional[UploadFile] = File(None),
     body_video: Optional[UploadFile] = File(None),
-    video: Optional[UploadFile] = File(None),  # Fallback: checks filename prefix
-    case_id: str = Form(...),
-    dog_name: Optional[str] = Form("Unknown"),
-    gender: Optional[str] = Form(None),
-    breed: Optional[str] = Form(None),
-    color: Optional[str] = Form(None)
+    # Flexible multi-file list in case website form submits multiple files under 'videos' or 'files'
+    videos: Optional[List[UploadFile]] = File(None)
 ):
     """
-    Registers a dog using dual video streams:
-      1. nose_video (or file prefixed with nose_): 40-50 sharp snout frames + embeddings.
-      2. body_video (or file prefixed with body_): 40-50 sharp full body frames (direct splitting).
+    Call 1: Registration
+    -------------------
+    Accepts:
+      - case_id, dog_name, and any extra form metadata.
+      - 2 video uploads distinguished by form key OR filename tag ('nose_*' vs 'body_*').
+    Processing:
+      - Nose video -> YOLO crop snout -> CLAHE -> 40-50 sharp vector embeddings.
+      - Body video -> Direct frame splitting -> 40-50 sharp vector embeddings (NO YOLO).
+      - NO videos or images are saved to disk. Only compact vector files (nose_vectors.npz, body_vectors.npz) & meta.json are stored.
     """
-    # Auto-sort if a single or combined video upload was passed with naming conventions
-    actual_nose_video = nose_video
-    actual_body_video = body_video
+    # 1. Parse additional metadata if passed as JSON string
+    form_data: Dict[str, Any] = {}
+    if metadata:
+        try:
+            form_data = json.loads(metadata)
+        except Exception:
+            form_data = {"raw_metadata": metadata}
 
-    if video is not None:
-        fname = (video.filename or "").lower()
-        if "nose" in fname and actual_nose_video is None:
-            actual_nose_video = video
-        elif "body" in fname and actual_body_video is None:
-            actual_body_video = video
-        elif actual_nose_video is None:
-            actual_nose_video = video
+    # 2. Sort files into Nose Video and Body Video based on key or filename prefix
+    actual_nose_vid: Optional[UploadFile] = nose_video
+    actual_body_vid: Optional[UploadFile] = body_video
 
-    if actual_nose_video is None and actual_body_video is None:
-        raise HTTPException(status_code=400, detail="At least one video (nose_video or body_video) must be provided.")
+    # Check flexible file list if provided
+    all_uploads = []
+    if videos:
+        all_uploads.extend(videos)
 
-    dog_dir = os.path.join(GALLERY_DIR, case_id)
-    os.makedirs(dog_dir, exist_ok=True)
+    for up in all_uploads:
+        fname = (up.filename or "").lower()
+        if ("nose" in fname or "snout" in fname or "face" in fname) and actual_nose_vid is None:
+            actual_nose_vid = up
+        elif ("body" in fname or "full" in fname) and actual_body_vid is None:
+            actual_body_vid = up
+        elif actual_nose_vid is None:
+            actual_nose_vid = up
+        elif actual_body_vid is None:
+            actual_body_vid = up
+
+    if actual_nose_vid is None and actual_body_vid is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Registration failed: Please provide at least one video (tagged with 'nose' or 'body')."
+        )
+
+    dog_folder = os.path.join(GALLERY_DIR, case_id)
+    os.makedirs(dog_folder, exist_ok=True)
 
     engine = VideoRegistrationEngine(
         target_fps=4.0,
         min_sharpness=65.0,
         min_body_sharpness=35.0,
-        target_k_frames=45  # Extract 40-50 frames automatically
+        target_k_frames=45  # 40-50 diverse frames
     )
 
-    enrolled_nose_frames = 0
-    enrolled_body_frames = 0
+    enrolled_nose_count = 0
+    enrolled_body_count = 0
 
-    # 1. Process Nose Video
-    if actual_nose_video is not None:
+    # 3. Process Nose Video (Cropped Snout -> Biometric Vectors)
+    if actual_nose_vid is not None:
         with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp_nose:
-            shutil.copyfileobj(actual_nose_video.file, tmp_nose)
-            tmp_nose_path = tmp_nose.name
+            shutil.copyfileobj(actual_nose_vid.file, tmp_nose)
+            tmp_path = tmp_nose.name
 
         try:
-            selected_frames, _ = engine.process_video(
-                tmp_nose_path,
+            selected_nose_frames, stats_n = engine.process_video(
+                tmp_path,
                 nose_detector_fn=nose_detector.detect_and_crop
             )
-            for idx, frame_obj in enumerate(selected_frames, start=1):
-                prefix = f"{idx:04d}"
+            nose_vecs = []
+            face_vecs = []
+            for frame_obj in selected_nose_frames:
                 emb_n, emb_f = extract_features(frame_obj.full_image, frame_obj.nose_crop)
-                np.save(os.path.join(dog_dir, f"{prefix}.npy"), emb_n)
-                np.save(os.path.join(dog_dir, f"face_{prefix}.npy"), emb_f)
-                frame_obj.nose_crop.save(os.path.join(dog_dir, f"{prefix}.jpg"), "JPEG", quality=95)
-                frame_obj.full_image.save(os.path.join(dog_dir, f"original_{prefix}.jpg"), "JPEG", quality=90)
-            enrolled_nose_frames = len(selected_frames)
-        finally:
-            if os.path.exists(tmp_nose_path):
-                os.remove(tmp_nose_path)
+                nose_vecs.append(emb_n)
+                face_vecs.append(emb_f)
 
-    # 2. Process Body Video (Direct frame extraction, bypasses nose detector)
-    if actual_body_video is not None:
+            if nose_vecs:
+                # Save as single compact compressed matrix
+                np.savez_compressed(
+                    os.path.join(dog_folder, "nose_vectors.npz"),
+                    nose_vectors=np.array(nose_vecs, dtype=np.float32),
+                    face_vectors=np.array(face_vecs, dtype=np.float32)
+                )
+                enrolled_nose_count = len(nose_vecs)
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+    # 4. Process Body Video (Direct Frame Splitting -> Body Vectors, NO YOLO)
+    if actual_body_vid is not None:
         with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp_body:
-            shutil.copyfileobj(actual_body_video.file, tmp_body)
+            shutil.copyfileobj(actual_body_vid.file, tmp_body)
             tmp_body_path = tmp_body.name
 
         try:
-            selected_body_frames, _ = engine.process_body_video(tmp_body_path)
-            for idx, b_frame in enumerate(selected_body_frames, start=1):
-                prefix = f"body_{idx:04d}"
+            selected_body_frames, stats_b = engine.process_body_video(tmp_body_path)
+            body_vecs = []
+            for b_frame in selected_body_frames:
                 _, emb_b = extract_features(b_frame.full_image, None)
-                np.save(os.path.join(dog_dir, f"{prefix}.npy"), emb_b)
-                b_frame.full_image.save(os.path.join(dog_dir, f"{prefix}.jpg"), "JPEG", quality=90)
-            enrolled_body_frames = len(selected_body_frames)
+                body_vecs.append(emb_b)
+
+            if body_vecs:
+                # Save as single compact compressed matrix
+                np.savez_compressed(
+                    os.path.join(dog_folder, "body_vectors.npz"),
+                    body_vectors=np.array(body_vecs, dtype=np.float32)
+                )
+                enrolled_body_count = len(body_vecs)
         finally:
             if os.path.exists(tmp_body_path):
                 os.remove(tmp_body_path)
 
+    # 5. Save Combined Master Metadata
     master_meta = {
         "case_id": case_id,
         "dog_name": dog_name,
-        "breed": breed,
-        "gender": gender,
-        "color": color,
         "registered_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "nose_frames_enrolled": enrolled_nose_frames,
-        "body_frames_enrolled": enrolled_body_frames,
-        "has_nose_stream": enrolled_nose_frames > 0,
-        "has_body_stream": enrolled_body_frames > 0
+        "nose_frames_enrolled": enrolled_nose_count,
+        "body_frames_enrolled": enrolled_body_count,
+        "has_nose_stream": enrolled_nose_count > 0,
+        "has_body_stream": enrolled_body_count > 0,
+        "form_metadata": form_data
     }
 
-    with open(os.path.join(dog_dir, "meta.json"), "w", encoding="utf-8") as f:
-        import json
+    with open(os.path.join(dog_folder, "meta.json"), "w", encoding="utf-8") as f:
         json.dump(master_meta, f, indent=2)
 
     return {
-        "status": "success",
+        "success": True,
+        "message": f"Successfully enrolled dog '{dog_name}' for case '{case_id}'.",
         "case_id": case_id,
-        "nose_frames_enrolled": enrolled_nose_frames,
-        "body_frames_enrolled": enrolled_body_frames,
+        "dog_name": dog_name,
+        "nose_frames_enrolled": enrolled_nose_count,
+        "body_frames_enrolled": enrolled_body_count,
         "metadata": master_meta
     }
 
+# ==============================================================================
+# CALL 2: IDENTIFICATION ENDPOINT
+# ==============================================================================
 @app.post("/api/v1/identify")
-async def identify_dog(
-    nose_image: Optional[UploadFile] = File(None),
-    body_image: Optional[UploadFile] = File(None),
-    image: Optional[UploadFile] = File(None),  # fallback query
+async def identify(
+    image: Optional[UploadFile] = File(None, description="Query image of the dog"),
+    photo: Optional[UploadFile] = File(None),  # Alias
+    file: Optional[UploadFile] = File(None),   # Alias
     gender: Optional[str] = Form(None)
 ):
     """
-    Multi-modal identification endpoint.
-    Applies strict weighting rules:
-      - Both present: 80% Nose + 20% Body
-      - Only Nose: 100% Nose
-      - Only Body: 100% Body
+    Call 2: Identification
+    ----------------------
+    Accepts:
+      - A single uploaded query image (under field 'image', 'photo', or 'file').
+    Processing:
+      - Detects snout crop. If detected -> extracts nose + face embeddings.
+      - Also computes full image body embedding.
+      - Matches against all registered dogs using Pure Cosine weighted rules:
+          • Both available in gallery: 80% Nose + 20% Body.
+          • Only Nose in gallery: 100% Nose.
+          • Only Body in gallery: 100% Body.
+    Returns:
+      - Status ('MATCH', 'LOW_CONFIDENCE', or 'UNKNOWN').
+      - Top matched case details and candidate ranking with similarity scores.
     """
-    actual_nose_img = nose_image
-    actual_body_img = body_image
+    actual_img = image or photo or file
+    if actual_img is None:
+        raise HTTPException(status_code=400, detail="Identification failed: Query image is required.")
 
-    if image is not None:
-        fname = (image.filename or "").lower()
-        if "body" in fname and actual_body_img is None:
-            actual_body_img = image
-        elif actual_nose_img is None:
-            actual_nose_img = image
+    img_bytes = await actual_img.read()
+    try:
+        pil_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid image file uploaded.")
 
-    if actual_nose_img is None and actual_body_img is None:
-        raise HTTPException(status_code=400, detail="Provide at least one query image (nose_image or body_image).")
+    # 1. Detect Snout
+    crop_res = nose_detector.detect_and_crop(pil_img)
+    has_snout = crop_res.crop is not None and crop_res.confidence >= 0.40
 
-    emb_nose, emb_face, emb_body = None, None, None
+    emb_nose, emb_face = None, None
+    if has_snout:
+        emb_nose, emb_face = extract_features(pil_img, crop_res.crop)
 
-    if actual_nose_img is not None:
-        bytes_n = await actual_nose_img.read()
-        pil_n = Image.open(io.BytesIO(bytes_n)).convert("RGB")
-        crop_res = nose_detector.detect_and_crop(pil_n)
-        emb_nose, emb_face = extract_features(pil_n, crop_res.crop)
+    # 2. Extract full-view body embedding as well
+    _, emb_body = extract_features(pil_img, None)
 
-    if actual_body_img is not None:
-        bytes_b = await actual_body_img.read()
-        pil_b = Image.open(io.BytesIO(bytes_b)).convert("RGB")
-        _, emb_body = extract_features(pil_b, None)
-
+    # 3. Match against gallery
     best_match, all_candidates = matcher.match(
         query_nose_emb=emb_nose,
         query_face_emb=emb_face,
@@ -225,18 +284,20 @@ async def identify_dog(
 
     if not best_match:
         return {
+            "success": True,
             "status": "UNKNOWN",
-            "message": "No biometric match found above acceptance gate.",
+            "message": "No match found above acceptance threshold.",
             "top_match": None,
             "candidates": []
         }
 
     return {
-        "status": best_match.status,
+        "success": True,
+        "status": best_match.status,  # 'MATCH', 'LOW_CONFIDENCE', 'UNKNOWN'
         "rule_applied": best_match.rule_applied,
         "top_match": {
             "case_id": best_match.dog_name,
-            "composite_score": round(best_match.cosine_score, 4),
+            "similarity_score": round(best_match.cosine_score, 4),
             "nose_score": round(best_match.nose_score, 4) if best_match.nose_score is not None else None,
             "body_score": round(best_match.body_score, 4) if best_match.body_score is not None else None,
             "best_matching_frame": best_match.best_matching_frame
@@ -244,7 +305,7 @@ async def identify_dog(
         "candidates": [
             {
                 "case_id": c.dog_name,
-                "composite_score": round(c.cosine_score, 4),
+                "similarity_score": round(c.cosine_score, 4),
                 "nose_score": round(c.nose_score, 4) if c.nose_score is not None else None,
                 "body_score": round(c.body_score, 4) if c.body_score is not None else None,
                 "rule_applied": c.rule_applied,

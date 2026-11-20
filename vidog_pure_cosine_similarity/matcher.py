@@ -108,48 +108,92 @@ class PureCosineMatcher:
             dog_path = os.path.join(self.gallery_dir, dog)
             all_files = sorted(os.listdir(dog_path))
 
-            # Gallery files
-            nose_npy_files = [f for f in all_files if f.endswith('.npy') and not f.startswith(('face_', 'body_')) and not f.endswith('_student.npy')]
-            body_npy_files = [f for f in all_files if f.startswith('body_') and f.endswith('.npy')]
+            # Multi-vector bundle support
+            nose_npz_p = os.path.join(dog_path, 'nose_vectors.npz')
+            body_npz_p = os.path.join(dog_path, 'body_vectors.npz')
 
             # --- 1. Compute Best Nose Score ---
             best_nose_sim = -1.0
             best_nose_frame = ''
-            if has_query_nose and nose_npy_files:
-                for npy_f in nose_npy_files:
-                    base_idx = npy_f[:-4]
-                    nose_p = os.path.join(dog_path, npy_f)
-                    face_p = os.path.join(dog_path, f'face_{base_idx}.npy')
+            if has_query_nose:
+                if os.path.exists(nose_npz_p):
                     try:
-                        g_nose = self._normalize_vec(np.load(nose_p))
-                        if g_nose is not None:
-                            n_sim = float(np.dot(q_nose, g_nose))
-                            if q_face is not None and os.path.exists(face_p):
-                                g_face = self._normalize_vec(np.load(face_p))
-                                if g_face is not None:
-                                    f_sim = float(np.dot(q_face, g_face))
-                                    n_sim = 0.85 * n_sim + 0.15 * f_sim
-                            if n_sim > best_nose_sim:
-                                best_nose_sim = n_sim
-                                best_nose_frame = f'{base_idx}.jpg'
+                        data = np.load(nose_npz_p)
+                        nose_mat = data.get('nose_vectors')  # (N, D)
+                        face_mat = data.get('face_vectors')  # (N, D)
+                        if nose_mat is not None and len(nose_mat) > 0:
+                            # Normalize gallery nose vectors along axis 1
+                            norms = np.linalg.norm(nose_mat, axis=1, keepdims=True)
+                            norms[norms < 1e-6] = 1.0
+                            norm_nose_mat = nose_mat / norms
+                            sims = np.dot(norm_nose_mat, q_nose)  # (N,)
+
+                            if q_face is not None and face_mat is not None and len(face_mat) == len(nose_mat):
+                                fnorms = np.linalg.norm(face_mat, axis=1, keepdims=True)
+                                fnorms[fnorms < 1e-6] = 1.0
+                                norm_face_mat = face_mat / fnorms
+                                fsims = np.dot(norm_face_mat, q_face)
+                                sims = 0.85 * sims + 0.15 * fsims
+
+                            best_idx = int(np.argmax(sims))
+                            best_nose_sim = float(sims[best_idx])
+                            best_nose_frame = f'frame_{best_idx+1:04d}'
                     except Exception as e:
-                        print(f'[WARN] Error loading {nose_p}: {e}')
+                        print(f'[WARN] Error loading {nose_npz_p}: {e}')
+                else:
+                    # Legacy fallback to separate individual .npy files
+                    nose_npy_files = [f for f in all_files if f.endswith('.npy') and not f.startswith(('face_', 'body_')) and not f.endswith('_student.npy')]
+                    for npy_f in nose_npy_files:
+                        base_idx = npy_f[:-4]
+                        nose_p = os.path.join(dog_path, npy_f)
+                        face_p = os.path.join(dog_path, f'face_{base_idx}.npy')
+                        try:
+                            g_nose = self._normalize_vec(np.load(nose_p))
+                            if g_nose is not None:
+                                n_sim = float(np.dot(q_nose, g_nose))
+                                if q_face is not None and os.path.exists(face_p):
+                                    g_face = self._normalize_vec(np.load(face_p))
+                                    if g_face is not None:
+                                        f_sim = float(np.dot(q_face, g_face))
+                                        n_sim = 0.85 * n_sim + 0.15 * f_sim
+                                if n_sim > best_nose_sim:
+                                    best_nose_sim = n_sim
+                                    best_nose_frame = f'{base_idx}.jpg'
+                        except Exception as e:
+                            print(f'[WARN] Error loading {nose_p}: {e}')
 
             # --- 2. Compute Best Body Score ---
             best_body_sim = -1.0
             best_body_frame = ''
-            if has_query_body and body_npy_files:
-                for b_file in body_npy_files:
-                    body_p = os.path.join(dog_path, b_file)
+            if has_query_body:
+                if os.path.exists(body_npz_p):
                     try:
-                        g_body = self._normalize_vec(np.load(body_p))
-                        if g_body is not None:
-                            b_sim = float(np.dot(q_body, g_body))
-                            if b_sim > best_body_sim:
-                                best_body_sim = b_sim
-                                best_body_frame = b_file.replace('.npy', '.jpg')
+                        data = np.load(body_npz_p)
+                        body_mat = data.get('body_vectors')  # (M, D)
+                        if body_mat is not None and len(body_mat) > 0:
+                            bnorms = np.linalg.norm(body_mat, axis=1, keepdims=True)
+                            bnorms[bnorms < 1e-6] = 1.0
+                            norm_body_mat = body_mat / bnorms
+                            bsims = np.dot(norm_body_mat, q_body)
+                            best_bidx = int(np.argmax(bsims))
+                            best_body_sim = float(bsims[best_bidx])
+                            best_body_frame = f'body_frame_{best_bidx+1:04d}'
                     except Exception as e:
-                        print(f'[WARN] Error loading {body_p}: {e}')
+                        print(f'[WARN] Error loading {body_npz_p}: {e}')
+                else:
+                    # Legacy fallback to separate individual body_*.npy files
+                    body_npy_files = [f for f in all_files if f.startswith('body_') and f.endswith('.npy')]
+                    for b_file in body_npy_files:
+                        body_p = os.path.join(dog_path, b_file)
+                        try:
+                            g_body = self._normalize_vec(np.load(body_p))
+                            if g_body is not None:
+                                b_sim = float(np.dot(q_body, g_body))
+                                if b_sim > best_body_sim:
+                                    best_body_sim = b_sim
+                                    best_body_frame = b_file.replace('.npy', '.jpg')
+                        except Exception as e:
+                            print(f'[WARN] Error loading {body_p}: {e}')
 
             # --- 3. Apply Decision Weighting Rules ---
             has_nose_match = best_nose_sim >= 0.0
