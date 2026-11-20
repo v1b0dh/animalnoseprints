@@ -18,24 +18,38 @@ class ExtractedFrame:
     is_valid: bool = True
     rejection_reason: str = ""
 
+@dataclass
+class ExtractedBodyFrame:
+    frame_idx: int
+    timestamp_sec: float
+    full_image: Image.Image
+    sharpness: float
+    is_valid: bool = True
+    rejection_reason: str = ""
+
 def compute_sharpness(img_gray: np.ndarray) -> float:
     return float(cv2.Laplacian(img_gray, cv2.CV_64F).var())
 
 class VideoRegistrationEngine:
     """
     Handles video ingestion, frame extraction, quality checks,
-    nose cropping, and greedy diversity filtering.
+    nose cropping, body frame sampling, and greedy diversity filtering.
+    Supports dual-stream inputs:
+      1) Nose video (processed for snout crops + head)
+      2) Body video (processed directly for full-body frames)
     """
     def __init__(
         self,
         target_fps: float = 4.0,
         min_sharpness: float = 75.0,
+        min_body_sharpness: float = 40.0,
         min_luminance: float = 30.0,
         max_luminance: float = 230.0,
-        target_k_frames: int = 50
+        target_k_frames: int = 45
     ):
         self.target_fps = target_fps
         self.min_sharpness = min_sharpness
+        self.min_body_sharpness = min_body_sharpness
         self.min_luminance = min_luminance
         self.max_luminance = max_luminance
         self.target_k_frames = target_k_frames
@@ -69,9 +83,8 @@ class VideoRegistrationEngine:
                 timestamp = current_frame_idx / video_fps
                 if progress_callback:
                     pct = min(0.65, current_frame_idx / max(1, total_frames))
-                    progress_callback(pct, f"Inspecting frame {current_frame_idx}/{total_frames} ({timestamp:.1f}s)...")
+                    progress_callback(pct, f"Inspecting nose frame {current_frame_idx}/{total_frames} ({timestamp:.1f}s)...")
 
-                # Convert to RGB & PIL
                 frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
                 frame_pil = Image.fromarray(frame_rgb)
                 gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
@@ -128,7 +141,7 @@ class VideoRegistrationEngine:
         valid_candidates = [f for f in raw_candidates if f.is_valid]
         
         if progress_callback:
-            progress_callback(0.85, f"Filtering {len(valid_candidates)} sharp frames for angle diversity...")
+            progress_callback(0.85, f"Filtering {len(valid_candidates)} sharp nose frames for diversity...")
 
         selected_frames = self._select_diverse_frames(valid_candidates, k=self.target_k_frames)
 
@@ -142,26 +155,131 @@ class VideoRegistrationEngine:
 
         return selected_frames, stats
 
+    def process_body_video(
+        self,
+        video_path: str,
+        progress_callback: Optional[Callable[[float, str], None]] = None
+    ) -> Tuple[List[ExtractedBodyFrame], dict]:
+        """
+        Samples body frames directly without running nose detector.
+        Extracts 40-50 high-sharpness, well-exposed full body frames.
+        """
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return [], {"error": f"Failed to open body video file: {video_path}"}
+
+        video_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        duration_sec = total_frames / max(video_fps, 1.0)
+        
+        sample_interval = max(1, int(round(video_fps / self.target_fps)))
+        
+        raw_candidates: List[ExtractedBodyFrame] = []
+        rejected_count = 0
+        current_frame_idx = 0
+
+        while True:
+            ret, frame_bgr = cap.read()
+            if not ret:
+                break
+
+            if current_frame_idx % sample_interval == 0:
+                timestamp = current_frame_idx / video_fps
+                if progress_callback:
+                    pct = min(0.70, current_frame_idx / max(1, total_frames))
+                    progress_callback(pct, f"Sampling body frame {current_frame_idx}/{total_frames} ({timestamp:.1f}s)...")
+
+                frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                frame_pil = Image.fromarray(frame_rgb)
+                gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+                sharpness = compute_sharpness(gray)
+                mean_lum = float(np.mean(gray))
+
+                is_valid = True
+                rejection_reason = ""
+
+                if sharpness < self.min_body_sharpness:
+                    is_valid = False
+                    rejection_reason = f"Low body sharpness ({sharpness:.1f} < {self.min_body_sharpness})"
+                    rejected_count += 1
+                elif mean_lum < self.min_luminance:
+                    is_valid = False
+                    rejection_reason = f"Underexposed (lum: {mean_lum:.1f})"
+                    rejected_count += 1
+                elif mean_lum > self.max_luminance:
+                    is_valid = False
+                    rejection_reason = f"Overexposed (lum: {mean_lum:.1f})"
+                    rejected_count += 1
+
+                extracted = ExtractedBodyFrame(
+                    frame_idx=current_frame_idx,
+                    timestamp_sec=timestamp,
+                    full_image=frame_pil,
+                    sharpness=sharpness,
+                    is_valid=is_valid,
+                    rejection_reason=rejection_reason
+                )
+                raw_candidates.append(extracted)
+
+            current_frame_idx += 1
+
+        cap.release()
+
+        valid_candidates = [f for f in raw_candidates if f.is_valid]
+        # Fallback to best available if video was blurry overall
+        if len(valid_candidates) < min(10, len(raw_candidates)):
+            valid_candidates = sorted(raw_candidates, key=lambda f: f.sharpness, reverse=True)[:self.target_k_frames]
+
+        selected_frames = self._select_diverse_body_frames(valid_candidates, k=self.target_k_frames)
+
+        stats = {
+            "total_frames_sampled": len(raw_candidates),
+            "valid_sharp_frames": len(valid_candidates),
+            "rejected_frames": rejected_count,
+            "selected_frames": len(selected_frames),
+            "duration_sec": duration_sec
+        }
+        return selected_frames, stats
+
     def _select_diverse_frames(self, frames: List[ExtractedFrame], k: int) -> List[ExtractedFrame]:
         if len(frames) <= k:
             return sorted(frames, key=lambda f: f.sharpness, reverse=True)
 
-        # Sort by sharpness descending
         sorted_by_sharp = sorted(frames, key=lambda f: f.sharpness, reverse=True)
         selected = [sorted_by_sharp[0]]
-        
-        # Greedy temporal / index spacing to capture varied movement angles
         remaining = sorted_by_sharp[1:]
         min_frame_gap = max(2, len(frames) // (k * 2))
 
         for cand in remaining:
             if len(selected) >= k:
                 break
-            # Ensure cand is spaced out from already selected frames
             if all(abs(cand.frame_idx - s.frame_idx) >= min_frame_gap for s in selected):
                 selected.append(cand)
 
-        # If still need more to reach k, fill with highest sharpness
+        if len(selected) < k:
+            for cand in remaining:
+                if cand not in selected:
+                    selected.append(cand)
+                if len(selected) >= k:
+                    break
+
+        return sorted(selected, key=lambda f: f.frame_idx)
+
+    def _select_diverse_body_frames(self, frames: List[ExtractedBodyFrame], k: int) -> List[ExtractedBodyFrame]:
+        if len(frames) <= k:
+            return sorted(frames, key=lambda f: f.sharpness, reverse=True)
+
+        sorted_by_sharp = sorted(frames, key=lambda f: f.sharpness, reverse=True)
+        selected = [sorted_by_sharp[0]]
+        remaining = sorted_by_sharp[1:]
+        min_frame_gap = max(2, len(frames) // (k * 2))
+
+        for cand in remaining:
+            if len(selected) >= k:
+                break
+            if all(abs(cand.frame_idx - s.frame_idx) >= min_frame_gap for s in selected):
+                selected.append(cand)
+
         if len(selected) < k:
             for cand in remaining:
                 if cand not in selected:

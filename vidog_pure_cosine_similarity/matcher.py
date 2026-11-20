@@ -12,21 +12,37 @@ class MatchCandidate:
     best_matching_frame: str
     status: str  # 'MATCH', 'LOW_CONFIDENCE', 'UNKNOWN'
     gender: Optional[str] = None
+    nose_score: Optional[float] = None
+    body_score: Optional[float] = None
+    rule_applied: str = "DEFAULT"
 
 class PureCosineMatcher:
+    """
+    Adaptive Biometric Matcher supporting Dual Modalities (Nose Biometrics + Full Body).
+    
+    Rules:
+      1. Both Nose and Body available:
+         Composite Score = (nose_weight * nose_score) + (body_weight * body_score) [Default: 0.80 Nose / 0.20 Body]
+      2. Nose available, Body NOT available:
+         Composite Score = 1.0 * nose_score
+      3. Body available, Nose NOT available:
+         Composite Score = 1.0 * body_score (with stricter threshold)
+    """
     def __init__(
         self,
         gallery_dir: str = 'data/gallery_v2',
         open_set_threshold: float = 0.68,
         match_acceptance_threshold: float = 0.78,
-        nose_weight: float = 0.85,
-        face_weight: float = 0.15
+        body_acceptance_threshold: float = 0.82,
+        nose_weight: float = 0.80,
+        body_weight: float = 0.20
     ):
         self.gallery_dir = gallery_dir
         self.open_set_threshold = open_set_threshold
         self.match_acceptance_threshold = match_acceptance_threshold
+        self.body_acceptance_threshold = body_acceptance_threshold
         self.nose_weight = nose_weight
-        self.face_weight = face_weight
+        self.body_weight = body_weight
 
     def _get_dog_gender(self, dog: str) -> Optional[str]:
         meta_path = os.path.join(self.gallery_dir, dog, 'meta.json')
@@ -39,10 +55,18 @@ class PureCosineMatcher:
                 pass
         return None
 
+    def _normalize_vec(self, vec: np.ndarray) -> Optional[np.ndarray]:
+        v = vec.flatten().astype(np.float32)
+        norm = np.linalg.norm(v)
+        if norm > 1e-6:
+            return v / norm
+        return None
+
     def match(
         self,
-        query_nose_emb: np.ndarray,
+        query_nose_emb: Optional[np.ndarray] = None,
         query_face_emb: Optional[np.ndarray] = None,
+        query_body_emb: Optional[np.ndarray] = None,
         gender: Optional[str] = None
     ) -> Tuple[Optional[MatchCandidate], List[MatchCandidate]]:
         if not os.path.exists(self.gallery_dir):
@@ -64,69 +88,108 @@ class PureCosineMatcher:
             if filtered_dogs:
                 dogs = filtered_dogs
 
-        q_nose = query_nose_emb.flatten().astype(np.float32)
-        q_nose_norm = np.linalg.norm(q_nose)
-        if q_nose_norm > 1e-6:
-            q_nose = q_nose / q_nose_norm
+        q_nose = self._normalize_vec(query_nose_emb) if query_nose_emb is not None else None
+        q_face = self._normalize_vec(query_face_emb) if query_face_emb is not None else None
+        q_body = self._normalize_vec(query_body_emb) if query_body_emb is not None else None
 
-        has_face = query_face_emb is not None
-        if has_face:
-            q_face = query_face_emb.flatten().astype(np.float32)
-            q_face_norm = np.linalg.norm(q_face)
-            if q_face_norm > 1e-6:
-                q_face = q_face / q_face_norm
+        has_query_nose = q_nose is not None
+        has_query_body = q_body is not None
 
-        # Compute max cosine similarity per dog across all stored frames
-        dog_cosine_scores: Dict[str, float] = {}
+        if not has_query_nose and not has_query_body:
+            return None, []
+
+        dog_composite_scores: Dict[str, float] = {}
+        dog_nose_scores: Dict[str, float] = {}
+        dog_body_scores: Dict[str, float] = {}
         dog_best_frames: Dict[str, str] = {}
+        dog_rules: Dict[str, str] = {}
 
         for dog in dogs:
             dog_path = os.path.join(self.gallery_dir, dog)
-            npy_files = [f for f in sorted(os.listdir(dog_path))
-                         if f.endswith('.npy') and not f.startswith('face_') and not f.endswith('_student.npy')]
-            
-            max_sim = -1.0
-            best_frame = ''
+            all_files = sorted(os.listdir(dog_path))
 
-            for npy_f in npy_files:
-                base_idx = npy_f[:-4]
-                nose_p = os.path.join(dog_path, npy_f)
-                face_p = os.path.join(dog_path, f'face_{base_idx}.npy')
+            # Gallery files
+            nose_npy_files = [f for f in all_files if f.endswith('.npy') and not f.startswith(('face_', 'body_')) and not f.endswith('_student.npy')]
+            body_npy_files = [f for f in all_files if f.startswith('body_') and f.endswith('.npy')]
 
-                try:
-                    g_nose = np.load(nose_p).flatten().astype(np.float32)
-                    g_norm = np.linalg.norm(g_nose)
-                    if g_norm > 1e-6:
-                        g_nose = g_nose / g_norm
+            # --- 1. Compute Best Nose Score ---
+            best_nose_sim = -1.0
+            best_nose_frame = ''
+            if has_query_nose and nose_npy_files:
+                for npy_f in nose_npy_files:
+                    base_idx = npy_f[:-4]
+                    nose_p = os.path.join(dog_path, npy_f)
+                    face_p = os.path.join(dog_path, f'face_{base_idx}.npy')
+                    try:
+                        g_nose = self._normalize_vec(np.load(nose_p))
+                        if g_nose is not None:
+                            n_sim = float(np.dot(q_nose, g_nose))
+                            if q_face is not None and os.path.exists(face_p):
+                                g_face = self._normalize_vec(np.load(face_p))
+                                if g_face is not None:
+                                    f_sim = float(np.dot(q_face, g_face))
+                                    n_sim = 0.85 * n_sim + 0.15 * f_sim
+                            if n_sim > best_nose_sim:
+                                best_nose_sim = n_sim
+                                best_nose_frame = f'{base_idx}.jpg'
+                    except Exception as e:
+                        print(f'[WARN] Error loading {nose_p}: {e}')
 
-                    nose_sim = float(np.dot(q_nose, g_nose))
+            # --- 2. Compute Best Body Score ---
+            best_body_sim = -1.0
+            best_body_frame = ''
+            if has_query_body and body_npy_files:
+                for b_file in body_npy_files:
+                    body_p = os.path.join(dog_path, b_file)
+                    try:
+                        g_body = self._normalize_vec(np.load(body_p))
+                        if g_body is not None:
+                            b_sim = float(np.dot(q_body, g_body))
+                            if b_sim > best_body_sim:
+                                best_body_sim = b_sim
+                                best_body_frame = b_file.replace('.npy', '.jpg')
+                    except Exception as e:
+                        print(f'[WARN] Error loading {body_p}: {e}')
 
-                    if has_face and os.path.exists(face_p):
-                        g_face = np.load(face_p).flatten().astype(np.float32)
-                        f_norm = np.linalg.norm(g_face)
-                        if f_norm > 1e-6:
-                            g_face = g_face / f_norm
-                        face_sim = float(np.dot(q_face, g_face))
-                        composite_sim = self.nose_weight * nose_sim + self.face_weight * face_sim
-                    else:
-                        composite_sim = nose_sim
+            # --- 3. Apply Decision Weighting Rules ---
+            has_nose_match = best_nose_sim >= 0.0
+            has_body_match = best_body_sim >= 0.0
 
-                    if composite_sim > max_sim:
-                        max_sim = composite_sim
-                        best_frame = f'{base_idx}.jpg'
+            if has_nose_match and has_body_match:
+                # Rule 1: Both Nose & Body available -> 80% Nose, 20% Body
+                composite = (self.nose_weight * best_nose_sim) + (self.body_weight * best_body_sim)
+                rule = "NOSE_80_BODY_20"
+                chosen_frame = best_nose_frame or best_body_frame
+            elif has_nose_match and not has_body_match:
+                # Rule 2: Only Nose available -> 100% Nose
+                composite = best_nose_sim
+                rule = "NOSE_ONLY_100"
+                chosen_frame = best_nose_frame
+            elif not has_nose_match and has_body_match:
+                # Rule 3: Only Body available -> 100% Body
+                composite = best_body_sim
+                rule = "BODY_ONLY_100"
+                chosen_frame = best_body_frame
+            else:
+                composite = -1.0
+                rule = "NO_DATA"
+                chosen_frame = ''
 
-                except Exception as e:
-                    print(f'[WARN] Error loading {nose_p}: {e}')
-
-            dog_cosine_scores[dog] = max_sim
-            dog_best_frames[dog] = best_frame
-
-        max_overall_cosine = max(dog_cosine_scores.values()) if dog_cosine_scores else -1.0
+            dog_composite_scores[dog] = composite
+            dog_nose_scores[dog] = best_nose_sim
+            dog_body_scores[dog] = best_body_sim
+            dog_best_frames[dog] = chosen_frame
+            dog_rules[dog] = rule
 
         candidates: List[MatchCandidate] = []
-        for dog in sorted(dogs, key=lambda d: dog_cosine_scores.get(d, -1.0), reverse=True):
-            score = dog_cosine_scores.get(dog, 0.0)
-            if score >= self.match_acceptance_threshold:
+        for dog in sorted(dogs, key=lambda d: dog_composite_scores.get(d, -1.0), reverse=True):
+            score = dog_composite_scores.get(dog, 0.0)
+            rule = dog_rules.get(dog, 'DEFAULT')
+
+            # Determine acceptance based on modality rule
+            acc_threshold = self.body_acceptance_threshold if rule == "BODY_ONLY_100" else self.match_acceptance_threshold
+
+            if score >= acc_threshold:
                 status = 'MATCH'
             elif score >= self.open_set_threshold:
                 status = 'LOW_CONFIDENCE'
@@ -139,7 +202,10 @@ class PureCosineMatcher:
                 hybrid_score=score,
                 best_matching_frame=dog_best_frames.get(dog, ''),
                 status=status,
-                gender=self._get_dog_gender(dog)
+                gender=self._get_dog_gender(dog),
+                nose_score=dog_nose_scores.get(dog) if dog_nose_scores.get(dog, -1.0) >= 0 else None,
+                body_score=dog_body_scores.get(dog) if dog_body_scores.get(dog, -1.0) >= 0 else None,
+                rule_applied=rule
             ))
 
         if not candidates or candidates[0].status == 'UNKNOWN':
