@@ -31,8 +31,11 @@ vidog/dataset/video_samples/dogo/dogid*.mp4
 _kilo/
 _archive/
 
-# Local datasets and papers
+# Local datasets, papers, and phodog
 paper/
 datasets/
+phodog/
 .kilo/
+.venv/
+venv/
 

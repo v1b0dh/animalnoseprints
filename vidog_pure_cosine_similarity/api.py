@@ -39,7 +39,38 @@ os.makedirs(GALLERY_DIR, exist_ok=True)
 # 1. Warm-up models in memory once at startup
 print("[INIT] Loading DNNetV3 model & YOLO snout detector...")
 pipeline = CLAHEPipeline(image_size=224)
-model = DNNetV3(pretrained=True, use_head=True)
+
+# Teacher checkpoint check:
+# If a custom fine-tuned weights file (teacher_best.pth / best.pt) exists, load with head (1024-d).
+# Otherwise, use headless backbone (use_head=False, 576-d) which uses deterministic ImageNet-22K
+# pretrained weights with NO random projection head, ensuring embeddings are 100% stable across restarts.
+CKPT_PATHS = [
+    os.path.join(CHECKPOINTS_DIR, "teacher_best.pth"),
+    os.path.join(CHECKPOINTS_DIR, "best.pth"),
+    os.path.join(CHECKPOINTS_DIR, "best.pt")
+]
+loaded_ckpt = False
+for cp in CKPT_PATHS:
+    if os.path.exists(cp):
+        try:
+            import torch
+            m = DNNetV3(pretrained=True, use_head=True)
+            ckpt = torch.load(cp, map_location="cpu")
+            sd = ckpt.get("model_state_dict", ckpt)
+            m.load_state_dict(sd)
+            model = m
+            loaded_ckpt = True
+            print(f"[INIT] Loaded fine-tuned teacher checkpoint from {cp} (1024-d embedding).")
+            break
+        except Exception as e:
+            print(f"[WARN] Failed loading checkpoint {cp}: {e}")
+
+if not loaded_ckpt:
+    import torch
+    # Deterministic headless backbone (ImageNet-22K weights, 576-d)
+    model = DNNetV3(pretrained=True, use_head=False)
+    print("[INIT] No fine-tuned checkpoint found. Initialized deterministic TinyViT-21M backbone (use_head=False, 576-d). Zero random numbers, perfectly reproducible across restarts.")
+
 model.eval()
 
 nose_detector = NoseDetector(weights_path=NOSE_DETECTOR_PATH)
