@@ -37,41 +37,34 @@ NOSE_DETECTOR_PATH = os.path.join(CHECKPOINTS_DIR, "nose_detector.onnx")
 os.makedirs(GALLERY_DIR, exist_ok=True)
 
 # 1. Warm-up models in memory once at startup
-print("[INIT] Loading DNNetV3 model & YOLO snout detector...")
+print("[INIT] Loading DNNetV3 biometric backbone & YOLO snout detector...")
 pipeline = CLAHEPipeline(image_size=224)
 
-# Teacher checkpoint check:
-# If a custom fine-tuned weights file (teacher_best.pth / best.pt) exists, load with head (1024-d).
-# Otherwise, use headless backbone (use_head=False, 576-d) which uses deterministic ImageNet-22K
-# pretrained weights with NO random projection head, ensuring embeddings are 100% stable across restarts.
-CKPT_PATHS = [
-    os.path.join(CHECKPOINTS_DIR, "teacher_best.pth"),
-    os.path.join(CHECKPOINTS_DIR, "best.pth"),
-    os.path.join(CHECKPOINTS_DIR, "best.pt")
-]
-loaded_ckpt = False
-for cp in CKPT_PATHS:
-    if os.path.exists(cp):
-        try:
-            import torch
-            m = DNNetV3(pretrained=True, use_head=True)
-            ckpt = torch.load(cp, map_location="cpu")
-            sd = ckpt.get("model_state_dict", ckpt)
-            m.load_state_dict(sd)
-            model = m
-            loaded_ckpt = True
-            print(f"[INIT] Loaded fine-tuned teacher checkpoint from {cp} (1024-d embedding).")
-            break
-        except Exception as e:
-            print(f"[WARN] Failed loading checkpoint {cp}: {e}")
+# STRICT HARD-LOCK: Enforce 1024-d fine-tuned MagFace weights
+# This prevents silent dimension mismatches (576 vs 1024) across server sessions.
+TEACHER_CKPT = os.path.join(CHECKPOINTS_DIR, "teacher_best.pth")
+FALLBACK_CKPT = os.path.join(CHECKPOINTS_DIR, "dnnet_v3_best.pth")
 
-if not loaded_ckpt:
-    import torch
-    # Deterministic headless backbone (ImageNet-22K weights, 576-d)
-    model = DNNetV3(pretrained=True, use_head=False)
-    print("[INIT] No fine-tuned checkpoint found. Initialized deterministic TinyViT-21M backbone (use_head=False, 576-d). Zero random numbers, perfectly reproducible across restarts.")
+target_ckpt = None
+if os.path.exists(TEACHER_CKPT):
+    target_ckpt = TEACHER_CKPT
+elif os.path.exists(FALLBACK_CKPT):
+    target_ckpt = FALLBACK_CKPT
 
+if not target_ckpt:
+    raise RuntimeError(
+        f"FATAL: Trained checkpoint not found in {CHECKPOINTS_DIR}! "
+        f"Expected 'teacher_best.pth' or 'dnnet_v3_best.pth'. "
+        f"Hard-lock active to prevent vector dimension mismatches."
+    )
+
+import torch
+model = DNNetV3(pretrained=True, use_head=True)
+ckpt = torch.load(target_ckpt, map_location="cpu")
+sd = ckpt.get("model_state_dict", ckpt)
+model.load_state_dict(sd)
 model.eval()
+print(f"[INIT] Successfully locked and loaded fine-tuned 1024-d backbone weights from {target_ckpt}.")
 
 nose_detector = NoseDetector(weights_path=NOSE_DETECTOR_PATH)
 matcher = PureCosineMatcher(
@@ -204,24 +197,42 @@ async def register(
             if os.path.exists(tmp_body_path):
                 os.remove(tmp_body_path)
 
-    # Simple meta record
+    # Load existing meta if updating an existing case, so previously uploaded streams are preserved!
+    meta_path = os.path.join(dog_folder, "meta.json")
+    existing_meta = {}
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                existing_meta = json.load(f)
+        except Exception:
+            pass
+
+    # Check if previously enrolled files already exist on disk
+    has_existing_nose = os.path.exists(os.path.join(dog_folder, "nose_vectors.npz"))
+    has_existing_body = os.path.exists(os.path.join(dog_folder, "body_vectors.npz"))
+
+    final_nose_count = enrolled_nose_count if actual_nose_vid is not None else existing_meta.get("nose_frames_enrolled", 0)
+    final_body_count = enrolled_body_count if actual_body_vid is not None else existing_meta.get("body_frames_enrolled", 0)
+
+    # Simple meta record (preserves existing stream history)
     meta = {
         "case_id": case_id,
+        "created_at": existing_meta.get("created_at", time.strftime("%Y-%m-%d %H:%M:%S")),
         "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "nose_frames_enrolled": enrolled_nose_count,
-        "body_frames_enrolled": enrolled_body_count,
-        "has_nose_stream": enrolled_nose_count > 0,
-        "has_body_stream": enrolled_body_count > 0
+        "nose_frames_enrolled": final_nose_count,
+        "body_frames_enrolled": final_body_count,
+        "has_nose_stream": has_existing_nose or (enrolled_nose_count > 0),
+        "has_body_stream": has_existing_body or (enrolled_body_count > 0)
     }
-    with open(os.path.join(dog_folder, "meta.json"), "w", encoding="utf-8") as f:
+    with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
 
     return {
         "status": "success",
-        "message": f"Vectors generated successfully. Dog for case ID '{case_id}' registered successfully.",
+        "message": f"Vectors generated successfully. Dog for case ID '{case_id}' registered/updated successfully.",
         "case_id": case_id,
-        "nose_frames_enrolled": enrolled_nose_count,
-        "body_frames_enrolled": enrolled_body_count
+        "nose_frames_enrolled": final_nose_count,
+        "body_frames_enrolled": final_body_count
     }
 
 # ==============================================================================

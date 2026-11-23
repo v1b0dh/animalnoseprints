@@ -122,6 +122,11 @@ class PureCosineMatcher:
                         nose_mat = data.get('nose_vectors')  # (N, D)
                         face_mat = data.get('face_vectors')  # (N, D)
                         if nose_mat is not None and len(nose_mat) > 0:
+                            # Dimension guard
+                            if nose_mat.shape[1] != q_nose.shape[0]:
+                                print(f"[WARN] Dimension mismatch for dog '{dog}': gallery has {nose_mat.shape[1]}-d, query has {q_nose.shape[0]}-d. Skipping.")
+                                continue
+
                             # Normalize gallery nose vectors along axis 1
                             norms = np.linalg.norm(nose_mat, axis=1, keepdims=True)
                             norms[norms < 1e-6] = 1.0
@@ -171,6 +176,11 @@ class PureCosineMatcher:
                         data = np.load(body_npz_p)
                         body_mat = data.get('body_vectors')  # (M, D)
                         if body_mat is not None and len(body_mat) > 0:
+                            # Dimension guard
+                            if body_mat.shape[1] != q_body.shape[0]:
+                                print(f"[WARN] Body dimension mismatch for dog '{dog}': gallery has {body_mat.shape[1]}-d, query has {q_body.shape[0]}-d. Skipping.")
+                                continue
+
                             bnorms = np.linalg.norm(body_mat, axis=1, keepdims=True)
                             bnorms[bnorms < 1e-6] = 1.0
                             norm_body_mat = body_mat / bnorms

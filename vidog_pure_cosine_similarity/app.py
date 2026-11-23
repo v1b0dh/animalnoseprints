@@ -46,26 +46,21 @@ st.markdown("""
 @st.cache_resource
 def load_backbone():
     pipeline = CLAHEPipeline(image_size=224)
-    CKPT_PATHS = [
-        os.path.join(CHECKPOINTS_DIR, "teacher_best.pth"),
-        os.path.join(CHECKPOINTS_DIR, "best.pth"),
-        os.path.join(CHECKPOINTS_DIR, "best.pt")
-    ]
-    model = None
-    for cp in CKPT_PATHS:
-        if os.path.exists(cp):
-            try:
-                import torch
-                m = DNNetV3(pretrained=True, use_head=True)
-                ckpt = torch.load(cp, map_location="cpu")
-                sd = ckpt.get("model_state_dict", ckpt)
-                m.load_state_dict(sd)
-                model = m
-                break
-            except Exception:
-                pass
-    if model is None:
-        model = DNNetV3(pretrained=True, use_head=False)
+    target_ckpt = None
+    for name in ["teacher_best.pth", "dnnet_v3_best.pth"]:
+        p = os.path.join(CHECKPOINTS_DIR, name)
+        if os.path.exists(p):
+            target_ckpt = p
+            break
+
+    if not target_ckpt:
+        raise RuntimeError(f"FATAL: Trained weights not found in {CHECKPOINTS_DIR}. Hard-lock active.")
+
+    import torch
+    model = DNNetV3(pretrained=True, use_head=True)
+    ckpt = torch.load(target_ckpt, map_location="cpu")
+    sd = ckpt.get("model_state_dict", ckpt)
+    model.load_state_dict(sd)
     model.eval()
     return model, pipeline
 
