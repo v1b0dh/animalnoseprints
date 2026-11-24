@@ -4,11 +4,15 @@ import time
 import json
 import shutil
 import tempfile
+import threading
 from typing import Optional, List
 import numpy as np
 from PIL import Image
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+
+# Thread lock to guarantee atomic, race-condition-free writes across concurrent requests
+FILE_WRITE_LOCK = threading.Lock()
 
 from det5 import DNNetV3, CLAHEPipeline
 from nose_detector import NoseDetector
@@ -164,11 +168,15 @@ async def register(
                 face_vecs.append(emb_f)
 
             if nose_vecs:
-                np.savez_compressed(
-                    os.path.join(dog_folder, "nose_vectors.npz"),
-                    nose_vectors=np.array(nose_vecs, dtype=np.float32),
-                    face_vectors=np.array(face_vecs, dtype=np.float32)
-                )
+                target_npz = os.path.join(dog_folder, "nose_vectors.npz")
+                tmp_npz = target_npz + ".tmp"
+                with FILE_WRITE_LOCK:
+                    np.savez_compressed(
+                        tmp_npz,
+                        nose_vectors=np.array(nose_vecs, dtype=np.float32),
+                        face_vectors=np.array(face_vecs, dtype=np.float32)
+                    )
+                    os.replace(tmp_npz, target_npz)
                 enrolled_nose_count = len(nose_vecs)
         finally:
             if os.path.exists(tmp_nose_path):
@@ -188,51 +196,56 @@ async def register(
                 body_vecs.append(emb_b)
 
             if body_vecs:
-                np.savez_compressed(
-                    os.path.join(dog_folder, "body_vectors.npz"),
-                    body_vectors=np.array(body_vecs, dtype=np.float32)
-                )
+                target_body_npz = os.path.join(dog_folder, "body_vectors.npz")
+                tmp_body_npz = target_body_npz + ".tmp"
+                with FILE_WRITE_LOCK:
+                    np.savez_compressed(
+                        tmp_body_npz,
+                        body_vectors=np.array(body_vecs, dtype=np.float32)
+                    )
+                    os.replace(tmp_body_npz, target_body_npz)
                 enrolled_body_count = len(body_vecs)
         finally:
             if os.path.exists(tmp_body_path):
                 os.remove(tmp_body_path)
 
-    # Load existing meta if updating an existing case, so previously uploaded streams are preserved!
+    # Atomic update for metadata with threading lock to prevent file corruption
     meta_path = os.path.join(dog_folder, "meta.json")
-    existing_meta = {}
-    if os.path.exists(meta_path):
-        try:
-            with open(meta_path, "r", encoding="utf-8") as f:
-                existing_meta = json.load(f)
-        except Exception:
-            pass
+    tmp_meta_path = meta_path + ".tmp"
+    with FILE_WRITE_LOCK:
+        existing_meta = {}
+        if os.path.exists(meta_path):
+            try:
+                with open(meta_path, "r", encoding="utf-8") as f:
+                    existing_meta = json.load(f)
+            except Exception:
+                pass
 
-    # Check if previously enrolled files already exist on disk
-    has_existing_nose = os.path.exists(os.path.join(dog_folder, "nose_vectors.npz"))
-    has_existing_body = os.path.exists(os.path.join(dog_folder, "body_vectors.npz"))
+        # Check if previously enrolled files already exist on disk
+        has_existing_nose = os.path.exists(os.path.join(dog_folder, "nose_vectors.npz"))
+        has_existing_body = os.path.exists(os.path.join(dog_folder, "body_vectors.npz"))
 
-    final_nose_count = enrolled_nose_count if actual_nose_vid is not None else existing_meta.get("nose_frames_enrolled", 0)
-    final_body_count = enrolled_body_count if actual_body_vid is not None else existing_meta.get("body_frames_enrolled", 0)
+        final_nose_count = enrolled_nose_count if actual_nose_vid is not None else existing_meta.get("nose_frames_enrolled", 0)
+        final_body_count = enrolled_body_count if actual_body_vid is not None else existing_meta.get("body_frames_enrolled", 0)
 
-    # Simple meta record (preserves existing stream history)
-    meta = {
-        "case_id": case_id,
-        "created_at": existing_meta.get("created_at", time.strftime("%Y-%m-%d %H:%M:%S")),
-        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "nose_frames_enrolled": final_nose_count,
-        "body_frames_enrolled": final_body_count,
-        "has_nose_stream": has_existing_nose or (enrolled_nose_count > 0),
-        "has_body_stream": has_existing_body or (enrolled_body_count > 0)
-    }
-    with open(meta_path, "w", encoding="utf-8") as f:
-        json.dump(meta, f, indent=2)
+        meta = {
+            "case_id": case_id,
+            "created_at": existing_meta.get("created_at", time.strftime("%Y-%m-%d %H:%M:%S")),
+            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "nose_frames_enrolled": final_nose_count,
+            "body_frames_enrolled": final_body_count,
+            "has_nose_stream": has_existing_nose or (enrolled_nose_count > 0),
+            "has_body_stream": has_existing_body or (enrolled_body_count > 0)
+        }
+        with open(tmp_meta_path, "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2)
+        os.replace(tmp_meta_path, meta_path)
 
     return {
         "status": "success",
         "message": f"Vectors generated successfully. Dog for case ID '{case_id}' registered/updated successfully.",
         "case_id": case_id,
-        "nose_frames_enrolled": final_nose_count,
-        "body_frames_enrolled": final_body_count
+        "metadata": meta
     }
 
 # ==============================================================================
@@ -288,18 +301,32 @@ async def identify(
             "candidates": []
         }
 
+    def _load_meta(case_name: str) -> Optional[dict]:
+        p = os.path.join(GALLERY_DIR, case_name, "meta.json")
+        if os.path.exists(p):
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return None
+
+    top_meta = _load_meta(best_match.dog_name)
+
     return {
         "status": best_match.status,  # "MATCH", "LOW_CONFIDENCE", or "UNKNOWN"
         "top_match": {
             "case_id": best_match.dog_name,
             "similarity_score": round(best_match.cosine_score, 4),
-            "rule_applied": best_match.rule_applied
+            "rule_applied": best_match.rule_applied,
+            "metadata": top_meta
         },
         "candidates": [
             {
                 "case_id": c.dog_name,
                 "similarity_score": round(c.cosine_score, 4),
-                "status": c.status
+                "status": c.status,
+                "metadata": _load_meta(c.dog_name)
             }
             for c in all_candidates[:5]
         ]

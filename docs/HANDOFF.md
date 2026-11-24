@@ -62,12 +62,21 @@ curl -X POST http://localhost:8000/api/v1/register \
 ```json
 {
   "status": "success",
-  "message": "Vectors generated successfully. Dog for case ID 'case-00124' registered successfully.",
+  "message": "Vectors generated successfully. Dog for case ID 'case-00124' registered/updated successfully.",
   "case_id": "case-00124",
-  "nose_frames_enrolled": 45,
-  "body_frames_enrolled": 45
+  "metadata": {
+    "case_id": "case-00124",
+    "created_at": "2026-11-24 10:45:00",
+    "updated_at": "2026-11-24 10:45:00",
+    "nose_frames_enrolled": 45,
+    "body_frames_enrolled": 45,
+    "has_nose_stream": true,
+    "has_body_stream": true
+  }
 }
 ```
+
+> **Database Storage Tip**: You can directly take the returned `"metadata"` JSON object and save it into your PostgreSQL / Prisma `biometric_metadata` (or JSONB) column for this case.
 
 ---
 
@@ -97,13 +106,23 @@ curl -X POST http://localhost:8000/api/v1/identify \
   "top_match": {
     "case_id": "case-00124",
     "similarity_score": 0.8924,
-    "rule_applied": "NOSE_80_BODY_20"
+    "rule_applied": "NOSE_80_BODY_20",
+    "metadata": {
+      "case_id": "case-00124",
+      "created_at": "2026-11-24 10:45:00",
+      "updated_at": "2026-11-24 10:45:00",
+      "nose_frames_enrolled": 45,
+      "body_frames_enrolled": 45,
+      "has_nose_stream": true,
+      "has_body_stream": true
+    }
   },
   "candidates": [
     {
       "case_id": "case-00124",
       "similarity_score": 0.8924,
-      "status": "MATCH"
+      "status": "MATCH",
+      "metadata": { ... }
     }
   ]
 }
