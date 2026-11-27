@@ -1,5 +1,6 @@
 import os
 import io
+import re
 import time
 import json
 import shutil
@@ -8,11 +9,16 @@ import threading
 from typing import Optional, List
 import numpy as np
 from PIL import Image
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 # Thread lock to guarantee atomic, race-condition-free writes across concurrent requests
 FILE_WRITE_LOCK = threading.Lock()
+
+# Security limits
+MAX_VIDEO_BYTES = int(os.getenv("MAX_VIDEO_BYTES", 150 * 1024 * 1024))  # 150 MB
+MAX_IMAGE_BYTES = int(os.getenv("MAX_IMAGE_BYTES", 15 * 1024 * 1024))   # 15 MB
+CASE_ID_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$")
 
 from det5 import DNNetV3, CLAHEPipeline
 from nose_detector import NoseDetector
@@ -25,11 +31,20 @@ app = FastAPI(
     version="3.1"
 )
 
+ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv(
+        "ALLOWED_ORIGINS",
+        "http://localhost:3000,http://localhost:5000,http://127.0.0.1:3000,http://127.0.0.1:5000",
+    ).split(",")
+    if origin.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 
@@ -64,7 +79,7 @@ if not target_ckpt:
 
 import torch
 model = DNNetV3(pretrained=True, use_head=True)
-ckpt = torch.load(target_ckpt, map_location="cpu")
+ckpt = torch.load(target_ckpt, map_location="cpu", weights_only=True)
 sd = ckpt.get("model_state_dict", ckpt)
 model.load_state_dict(sd)
 model.eval()
@@ -80,6 +95,58 @@ matcher = PureCosineMatcher(
     body_weight=0.20
 )
 print("[INIT] Ready.")
+
+def _safe_case_dir(case_id: str) -> str:
+    """Validate case_id and ensure the resolved directory stays strictly inside GALLERY_DIR."""
+    cleaned = case_id.strip()
+    if not CASE_ID_PATTERN.match(cleaned):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid case_id. Use 1-128 alphanumeric characters, hyphens, or underscores (cannot start with '.' or '_').",
+        )
+    gallery_real = os.path.realpath(GALLERY_DIR)
+    target_real = os.path.realpath(os.path.join(gallery_real, cleaned))
+    if not target_real.startswith(gallery_real + os.sep):
+        raise HTTPException(status_code=400, detail="Invalid case_id path.")
+    return target_real
+
+
+def _save_upload_to_temp(upload: UploadFile, max_bytes: int) -> str:
+    """Stream an uploaded file to a temporary file while enforcing a strict byte limit."""
+    total_bytes = 0
+    tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+    try:
+        while True:
+            chunk = upload.file.read(1024 * 1024)  # 1 MB chunks
+            if not chunk:
+                break
+            total_bytes += len(chunk)
+            if total_bytes > max_bytes:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"Uploaded video exceeds maximum allowed size ({max_bytes // (1024 * 1024)} MB).",
+                )
+            tmp.write(chunk)
+        tmp.close()
+        return tmp.name
+    except Exception:
+        tmp.close()
+        if os.path.exists(tmp.name):
+            os.remove(tmp.name)
+        raise
+
+
+def _save_npz_atomic(target_path: str, **arrays: np.ndarray) -> None:
+    """Atomically write compressed .npz arrays; temp name must end in .npz so NumPy doesn't append another .npz."""
+    tmp_path = os.path.join(os.path.dirname(target_path), f".tmp_{os.path.basename(target_path)}")
+    with FILE_WRITE_LOCK:
+        try:
+            np.savez_compressed(tmp_path, **arrays)
+            os.replace(tmp_path, target_path)
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
 
 def extract_features(img_pil: Image.Image, nose_pil: Optional[Image.Image] = None):
     import torch
@@ -135,8 +202,8 @@ async def register(
     if actual_nose_vid is None and actual_body_vid is None:
         raise HTTPException(status_code=400, detail="Provide at least one video (nose_video or body_video).")
 
-    # Folder dedicated to this case_id
-    dog_folder = os.path.join(GALLERY_DIR, case_id)
+    # Folder dedicated to this case_id (path-traversal protected)
+    dog_folder = _safe_case_dir(case_id)
     os.makedirs(dog_folder, exist_ok=True)
 
     engine = VideoRegistrationEngine(
@@ -151,10 +218,7 @@ async def register(
 
     # Process Nose Video: YOLO detect -> crop -> extract 40-50 vectors
     if actual_nose_vid is not None:
-        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp_nose:
-            shutil.copyfileobj(actual_nose_vid.file, tmp_nose)
-            tmp_nose_path = tmp_nose.name
-
+        tmp_nose_path = _save_upload_to_temp(actual_nose_vid, MAX_VIDEO_BYTES)
         try:
             selected_nose_frames, _ = engine.process_video(
                 tmp_nose_path,
@@ -168,15 +232,11 @@ async def register(
                 face_vecs.append(emb_f)
 
             if nose_vecs:
-                target_npz = os.path.join(dog_folder, "nose_vectors.npz")
-                tmp_npz = target_npz + ".tmp"
-                with FILE_WRITE_LOCK:
-                    np.savez_compressed(
-                        tmp_npz,
-                        nose_vectors=np.array(nose_vecs, dtype=np.float32),
-                        face_vectors=np.array(face_vecs, dtype=np.float32)
-                    )
-                    os.replace(tmp_npz, target_npz)
+                _save_npz_atomic(
+                    os.path.join(dog_folder, "nose_vectors.npz"),
+                    nose_vectors=np.array(nose_vecs, dtype=np.float32),
+                    face_vectors=np.array(face_vecs, dtype=np.float32),
+                )
                 enrolled_nose_count = len(nose_vecs)
         finally:
             if os.path.exists(tmp_nose_path):
@@ -184,10 +244,7 @@ async def register(
 
     # Process Body Video: direct frame sampling (No YOLO) -> extract 40-50 vectors
     if actual_body_vid is not None:
-        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp_body:
-            shutil.copyfileobj(actual_body_vid.file, tmp_body)
-            tmp_body_path = tmp_body.name
-
+        tmp_body_path = _save_upload_to_temp(actual_body_vid, MAX_VIDEO_BYTES)
         try:
             selected_body_frames, _ = engine.process_body_video(tmp_body_path)
             body_vecs = []
@@ -196,18 +253,20 @@ async def register(
                 body_vecs.append(emb_b)
 
             if body_vecs:
-                target_body_npz = os.path.join(dog_folder, "body_vectors.npz")
-                tmp_body_npz = target_body_npz + ".tmp"
-                with FILE_WRITE_LOCK:
-                    np.savez_compressed(
-                        tmp_body_npz,
-                        body_vectors=np.array(body_vecs, dtype=np.float32)
-                    )
-                    os.replace(tmp_body_npz, target_body_npz)
+                _save_npz_atomic(
+                    os.path.join(dog_folder, "body_vectors.npz"),
+                    body_vectors=np.array(body_vecs, dtype=np.float32),
+                )
                 enrolled_body_count = len(body_vecs)
         finally:
             if os.path.exists(tmp_body_path):
                 os.remove(tmp_body_path)
+
+    if enrolled_nose_count == 0 and enrolled_body_count == 0:
+        raise HTTPException(
+            status_code=422,
+            detail="Could not extract any sharp frames from the uploaded video(s). Please upload clearer footage.",
+        )
 
     # Atomic update for metadata with threading lock to prevent file corruption
     meta_path = os.path.join(dog_folder, "meta.json")
@@ -235,7 +294,9 @@ async def register(
             "nose_frames_enrolled": final_nose_count,
             "body_frames_enrolled": final_body_count,
             "has_nose_stream": has_existing_nose or (enrolled_nose_count > 0),
-            "has_body_stream": has_existing_body or (enrolled_body_count > 0)
+            "has_body_stream": has_existing_body or (enrolled_body_count > 0),
+            "nose_reupload_recommended": final_nose_count == 10,
+            "body_reupload_recommended": final_body_count == 10,
         }
         with open(tmp_meta_path, "w", encoding="utf-8") as f:
             json.dump(meta, f, indent=2)
@@ -269,15 +330,20 @@ async def identify(
     if actual_img is None:
         raise HTTPException(status_code=400, detail="Query image is required.")
 
-    img_bytes = await actual_img.read()
+    img_bytes = await actual_img.read(MAX_IMAGE_BYTES + 1)
+    if len(img_bytes) > MAX_IMAGE_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Uploaded image exceeds maximum allowed size ({MAX_IMAGE_BYTES // (1024 * 1024)} MB).",
+        )
     try:
         pil_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid image uploaded.")
 
-    # 1. Check for snout
+    # 1. Check for snout (only trust actual YOLO detections, not center_fallback)
     crop_res = nose_detector.detect_and_crop(pil_img)
-    has_snout = crop_res.crop is not None and crop_res.confidence >= 0.40
+    has_snout = crop_res.source == "model" and crop_res.crop is not None and crop_res.confidence >= 0.40
 
     emb_nose, emb_face = None, None
     if has_snout:

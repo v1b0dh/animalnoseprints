@@ -71,11 +71,17 @@ curl -X POST http://localhost:8000/api/v1/register \
     "nose_frames_enrolled": 45,
     "body_frames_enrolled": 45,
     "has_nose_stream": true,
-    "has_body_stream": true
+    "has_body_stream": true,
+    "nose_reupload_recommended": false,
+    "body_reupload_recommended": false
   }
 }
 ```
 
+> **Blurry Video Fallback (10 Frames = Re-upload Prompt)**:
+> If a video is very blurry, our engine falls back to storing the **10 sharpest frames** so the case still gets enrolled (`nose_frames_enrolled === 10` or `body_frames_enrolled === 10`, and `*_reupload_recommended === true`).
+> On the frontend, if you see `10` frames returned for either stream, prompt the user to re-upload a clearer video. When they re-upload and call `POST /api/v1/register` with the same `case_id`, our API **automatically overrides** the old vectors for that stream with fresh frames.
+>
 > **Database Storage Tip**: You can directly take the returned `"metadata"` JSON object and save it into your PostgreSQL / Prisma `biometric_metadata` (or JSONB) column for this case.
 
 ---

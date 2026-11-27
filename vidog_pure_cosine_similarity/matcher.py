@@ -122,27 +122,26 @@ class PureCosineMatcher:
                         nose_mat = data.get('nose_vectors')  # (N, D)
                         face_mat = data.get('face_vectors')  # (N, D)
                         if nose_mat is not None and len(nose_mat) > 0:
-                            # Dimension guard
+                            # Dimension guard (skip only nose modality if mismatched)
                             if nose_mat.shape[1] != q_nose.shape[0]:
-                                print(f"[WARN] Dimension mismatch for dog '{dog}': gallery has {nose_mat.shape[1]}-d, query has {q_nose.shape[0]}-d. Skipping.")
-                                continue
+                                print(f"[WARN] Dimension mismatch for dog '{dog}': gallery has {nose_mat.shape[1]}-d, query has {q_nose.shape[0]}-d. Skipping nose.")
+                            else:
+                                # Normalize gallery nose vectors along axis 1
+                                norms = np.linalg.norm(nose_mat, axis=1, keepdims=True)
+                                norms[norms < 1e-6] = 1.0
+                                norm_nose_mat = nose_mat / norms
+                                sims = np.dot(norm_nose_mat, q_nose)  # (N,)
 
-                            # Normalize gallery nose vectors along axis 1
-                            norms = np.linalg.norm(nose_mat, axis=1, keepdims=True)
-                            norms[norms < 1e-6] = 1.0
-                            norm_nose_mat = nose_mat / norms
-                            sims = np.dot(norm_nose_mat, q_nose)  # (N,)
+                                if q_face is not None and face_mat is not None and len(face_mat) == len(nose_mat):
+                                    fnorms = np.linalg.norm(face_mat, axis=1, keepdims=True)
+                                    fnorms[fnorms < 1e-6] = 1.0
+                                    norm_face_mat = face_mat / fnorms
+                                    fsims = np.dot(norm_face_mat, q_face)
+                                    sims = 0.85 * sims + 0.15 * fsims
 
-                            if q_face is not None and face_mat is not None and len(face_mat) == len(nose_mat):
-                                fnorms = np.linalg.norm(face_mat, axis=1, keepdims=True)
-                                fnorms[fnorms < 1e-6] = 1.0
-                                norm_face_mat = face_mat / fnorms
-                                fsims = np.dot(norm_face_mat, q_face)
-                                sims = 0.85 * sims + 0.15 * fsims
-
-                            best_idx = int(np.argmax(sims))
-                            best_nose_sim = float(sims[best_idx])
-                            best_nose_frame = f'frame_{best_idx+1:04d}'
+                                best_idx = int(np.argmax(sims))
+                                best_nose_sim = float(sims[best_idx])
+                                best_nose_frame = f'frame_{best_idx+1:04d}'
                     except Exception as e:
                         print(f'[WARN] Error loading {nose_npz_p}: {e}')
                 else:
@@ -176,18 +175,17 @@ class PureCosineMatcher:
                         data = np.load(body_npz_p)
                         body_mat = data.get('body_vectors')  # (M, D)
                         if body_mat is not None and len(body_mat) > 0:
-                            # Dimension guard
+                            # Dimension guard (skip only body modality if mismatched)
                             if body_mat.shape[1] != q_body.shape[0]:
-                                print(f"[WARN] Body dimension mismatch for dog '{dog}': gallery has {body_mat.shape[1]}-d, query has {q_body.shape[0]}-d. Skipping.")
-                                continue
-
-                            bnorms = np.linalg.norm(body_mat, axis=1, keepdims=True)
-                            bnorms[bnorms < 1e-6] = 1.0
-                            norm_body_mat = body_mat / bnorms
-                            bsims = np.dot(norm_body_mat, q_body)
-                            best_bidx = int(np.argmax(bsims))
-                            best_body_sim = float(bsims[best_bidx])
-                            best_body_frame = f'body_frame_{best_bidx+1:04d}'
+                                print(f"[WARN] Body dimension mismatch for dog '{dog}': gallery has {body_mat.shape[1]}-d, query has {q_body.shape[0]}-d. Skipping body.")
+                            else:
+                                bnorms = np.linalg.norm(body_mat, axis=1, keepdims=True)
+                                bnorms[bnorms < 1e-6] = 1.0
+                                norm_body_mat = body_mat / bnorms
+                                bsims = np.dot(norm_body_mat, q_body)
+                                best_bidx = int(np.argmax(bsims))
+                                best_body_sim = float(bsims[best_bidx])
+                                best_body_frame = f'body_frame_{best_bidx+1:04d}'
                     except Exception as e:
                         print(f'[WARN] Error loading {body_npz_p}: {e}')
                 else:

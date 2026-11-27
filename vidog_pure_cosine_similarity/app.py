@@ -1,9 +1,11 @@
 import io
 import os
+import re
 import sys
 import json
 import time
 import tempfile
+from typing import Optional
 import numpy as np
 from PIL import Image
 import streamlit as st
@@ -20,11 +22,9 @@ from nose_detector import NoseDetector
 from video_engine import VideoRegistrationEngine
 from matcher import PureCosineMatcher
 
-GALLERY_V2_DIR = "data/gallery_v2"
-CHECKPOINTS_DIR = "checkpoints"
-NOSE_DETECTOR_PATH = os.path.join(CHECKPOINTS_DIR, "nose_detector.onnx")
 GALLERY_V2_DIR = os.path.join(CUR_DIR, "data", "gallery_v2")
-NOSE_DETECTOR_PATH = os.path.join(CUR_DIR, "checkpoints", "nose_detector.onnx")
+CHECKPOINTS_DIR = os.path.join(CUR_DIR, "checkpoints")
+NOSE_DETECTOR_PATH = os.path.join(CHECKPOINTS_DIR, "nose_detector.onnx")
 
 st.set_page_config(
     page_title="DogID v2 (Video + Hybrid)",
@@ -58,7 +58,7 @@ def load_backbone():
 
     import torch
     model = DNNetV3(pretrained=True, use_head=True)
-    ckpt = torch.load(target_ckpt, map_location="cpu")
+    ckpt = torch.load(target_ckpt, map_location="cpu", weights_only=True)
     sd = ckpt.get("model_state_dict", ckpt)
     model.load_state_dict(sd)
     model.eval()
@@ -142,7 +142,8 @@ with tab_register:
             progress_bar = st.progress(0.0)
             status_text = st.empty()
 
-            dog_dir = os.path.join(GALLERY_V2_DIR, dog_name.replace(" ", "_"))
+            safe_dog_name = re.sub(r"[^a-zA-Z0-9_-]", "_", dog_name).lstrip("._") or "unknown_dog"
+            dog_dir = os.path.join(GALLERY_V2_DIR, safe_dog_name)
             os.makedirs(dog_dir, exist_ok=True)
 
             engine = VideoRegistrationEngine(

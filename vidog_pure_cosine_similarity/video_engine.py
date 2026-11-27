@@ -137,19 +137,25 @@ class VideoRegistrationEngine:
 
         cap.release()
 
-        # Step 4: Diversity & Selection of Top K
+        # Step 4: Diversity & Selection of Top K (with 10-frame blurry fallback)
         valid_candidates = [f for f in raw_candidates if f.is_valid]
-        
-        if progress_callback:
-            progress_callback(0.85, f"Filtering {len(valid_candidates)} sharp nose frames for diversity...")
+        blurry_fallback_used = False
 
-        selected_frames = self._select_diverse_frames(valid_candidates, k=self.target_k_frames)
+        if len(valid_candidates) < min(10, len(raw_candidates)):
+            # Blurry fallback: pick the top 10 sharpest frames no matter what
+            blurry_fallback_used = True
+            selected_frames = sorted(raw_candidates, key=lambda f: f.sharpness, reverse=True)[:10]
+        else:
+            if progress_callback:
+                progress_callback(0.85, f"Filtering {len(valid_candidates)} sharp nose frames for diversity...")
+            selected_frames = self._select_diverse_frames(valid_candidates, k=self.target_k_frames)
 
         stats = {
             "total_frames_sampled": len(raw_candidates),
             "valid_sharp_frames": len(valid_candidates),
             "rejected_frames": rejected_count,
             "selected_frames": len(selected_frames),
+            "blurry_fallback_used": blurry_fallback_used,
             "duration_sec": duration_sec
         }
 
@@ -226,17 +232,21 @@ class VideoRegistrationEngine:
         cap.release()
 
         valid_candidates = [f for f in raw_candidates if f.is_valid]
-        # Fallback to best available if video was blurry overall
-        if len(valid_candidates) < min(10, len(raw_candidates)):
-            valid_candidates = sorted(raw_candidates, key=lambda f: f.sharpness, reverse=True)[:self.target_k_frames]
+        blurry_fallback_used = False
 
-        selected_frames = self._select_diverse_body_frames(valid_candidates, k=self.target_k_frames)
+        # Fallback to top 10 sharpest frames if video was blurry overall
+        if len(valid_candidates) < min(10, len(raw_candidates)):
+            blurry_fallback_used = True
+            selected_frames = sorted(raw_candidates, key=lambda f: f.sharpness, reverse=True)[:10]
+        else:
+            selected_frames = self._select_diverse_body_frames(valid_candidates, k=self.target_k_frames)
 
         stats = {
             "total_frames_sampled": len(raw_candidates),
             "valid_sharp_frames": len(valid_candidates),
             "rejected_frames": rejected_count,
             "selected_frames": len(selected_frames),
+            "blurry_fallback_used": blurry_fallback_used,
             "duration_sec": duration_sec
         }
         return selected_frames, stats
